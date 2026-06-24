@@ -1,0 +1,46 @@
+# ── Royal 1 engine — production Docker Compose ─────────────────────────────
+#   cp .env.example .env   # set DATABASE_URL to the SHARED MongoDB
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# The engine shares the same MongoDB as the website (Vercel). It creates and
+# settles rounds and exposes /health on port 4000.
+
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: royal-engine:latest
+    container_name: royal-engine
+    restart: always
+    # Load all engine settings from .env (DATABASE_URL, secrets, intervals…).
+    env_file:
+      - .env
+    # Sensible defaults; overridden by anything in .env.
+    environment:
+      NODE_ENV: production
+      HEALTH_PORT: 4000
+      ENGINE_INTERVAL: ${ENGINE_INTERVAL:-1000}
+    ports:
+      - "4000:4000"
+    # Persist structured logs (engine.log / settlement.log / error.log) on host.
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:'+(process.env.HEALTH_PORT||4000)+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

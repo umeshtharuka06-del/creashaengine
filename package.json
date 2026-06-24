@@ -8,6 +8,7 @@
     "worker": "tsx scripts/settle-worker.ts",
     "create-rounds": "tsx scripts/create-rounds.ts",
     "process-rounds": "tsx scripts/process-rounds.ts",
+    "build": "prisma generate && tsc --noEmit",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "postinstall": "prisma generate"
