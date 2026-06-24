@@ -1,10 +1,13 @@
-# ── Royal 1 engine — production Docker Compose ─────────────────────────────
-#   cp .env.example .env   # set DATABASE_URL to the SHARED MongoDB
+# ── Royal 1 engine — production Docker Compose (Portainer-friendly) ────────
+# No .env file is required. Supply variables as Portainer STACK ENVIRONMENT
+# VARIABLES (Stacks → your stack → Environment variables), or with `docker
+# compose` from the shell environment. Anything not set falls back to the
+# defaults below, so the container starts even with no local .env.
+#
+# The ONLY value you must provide is DATABASE_URL (the shared MongoDB).
+#
 #   docker compose up -d --build
 #   docker compose logs -f
-#
-# The engine shares the same MongoDB as the website (Vercel). It creates and
-# settles rounds and exposes /health on port 4000.
 
 services:
   engine:
@@ -14,19 +17,19 @@ services:
     image: royal-engine:latest
     container_name: royal-engine
     restart: always
-    # Load all engine settings from .env (DATABASE_URL, secrets, intervals…).
-    env_file:
-      - .env
-    # Sensible defaults; overridden by anything in .env.
+    # All config comes from stack/shell env with safe defaults — no env_file.
     environment:
-      NODE_ENV: production
-      HEALTH_PORT: 4000
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: ${DATABASE_URL:-}
+      JWT_SECRET: ${JWT_SECRET:-}
+      FAIR_SECRET: ${FAIR_SECRET:-}
       ENGINE_INTERVAL: ${ENGINE_INTERVAL:-1000}
+      HEALTH_PORT: ${HEALTH_PORT:-4000}
     ports:
-      - "4000:4000"
-    # Persist structured logs (engine.log / settlement.log / error.log) on host.
+      - "${HEALTH_PORT:-4000}:${HEALTH_PORT:-4000}"
+    # Named volume (not a host bind path) so Portainer git/stack deploys work.
     volumes:
-      - ./logs:/app/logs
+      - engine-logs:/app/logs
     healthcheck:
       test:
         [
@@ -44,3 +47,6 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+volumes:
+  engine-logs:

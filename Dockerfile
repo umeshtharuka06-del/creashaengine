@@ -10,7 +10,12 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-ENV NODE_ENV=production
+
+# Baked-in defaults so the container starts WITHOUT any .env file. Only
+# DATABASE_URL must be supplied at runtime (Portainer stack env / docker -e).
+ENV NODE_ENV=production \
+    HEALTH_PORT=4000 \
+    ENGINE_INTERVAL=1000
 
 # 1) Install dependencies. Copy the manifest + prisma schema first so
 #    `npm install` (which runs `prisma generate` via postinstall) is cached.
@@ -25,7 +30,7 @@ COPY . .
 # 3) Build step: regenerate the Prisma client and type-check the worker.
 RUN npm run build
 
-# 4) Health endpoint port (HEALTH_PORT in .env must match — default 4000).
+# 4) Health endpoint port (matches the HEALTH_PORT env default of 4000).
 EXPOSE 4000
 
 # 5) Container healthcheck → GET /health (uses Node so no curl dependency).
