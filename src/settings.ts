@@ -11,6 +11,12 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   color_lock_seconds: "5",
   number_round_seconds: "180",
   number_lock_seconds: "5",
+  // Integrated prediction game modes (see website settings.ts for docs).
+  parity_round_seconds: "60",
+  sapre_round_seconds: "180",
+  bcone_round_seconds: "180",
+  emerd_round_seconds: "300",
+  prediction_lock_seconds: "5",
   crash_betting_seconds: "8",
   crash_house_edge_pct: "1",
   prediction_heavy_win_rate: "0.4",

@@ -294,3 +294,125 @@ export function decideNumberResult(opts: {
     stats,
   };
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  UNIFIED PREDICTION DECIDER  (Color + Number in ONE round)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  The 2026 redesign merges Color and Number into a single round per game mode
+ *  (PARITY / SAPRE / BCONE / EMERD). One digit 0–9 is drawn; colour bets settle
+ *  by the digit's colour(s) and number bets settle by exact-digit match.
+ *
+ *  Because both bet kinds resolve from the SAME digit, the house rule is applied
+ *  at the DIGIT level: for each candidate digit we compute the total payout the
+ *  house would owe if it won (colour payouts + number payouts). The "heavy"
+ *  digit is the most expensive one; it is made to LOSE most of the time. To stay
+ *  believable the heavy digit still wins ~`heavyWinRate` of rounds; otherwise a
+ *  cheaper digit wins, weighted INVERSELY to its payout (cheapest = likeliest).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Per-colour payout multiplier for a given winning digit. */
+export const COLOR_PAYOUT: Record<ColorKey, (digit: number) => number> = {
+  RED: (d) => (d === 0 ? 1.5 : 2),
+  GREEN: (d) => (d === 5 ? 1.5 : 2),
+  VIOLET: () => 4.5,
+};
+/** Exact-number payout multiplier. */
+export const NUMBER_PAYOUT = 9;
+
+function isColorKey(s: string): s is ColorKey {
+  return s === "RED" || s === "GREEN" || s === "VIOLET";
+}
+
+/**
+ * Coin-cents the house pays a single bet if `digit` is the result (0 if it loses).
+ * Shared by the decider (to price digits) and by settlement (to pay winners).
+ */
+export function payoutForBet(selection: string, amount: number, digit: number): number {
+  if (isColorKey(selection)) {
+    const cols = colorsOfDigit(digit);
+    if (!cols.includes(selection)) return 0;
+    return Math.floor(amount * COLOR_PAYOUT[selection](digit));
+  }
+  const n = Number(selection);
+  if (Number.isInteger(n) && n >= 0 && n <= 9 && n === digit) {
+    return amount * NUMBER_PAYOUT;
+  }
+  return 0;
+}
+
+/** Total house exposure (coin-cents) across all bets if `digit` wins. */
+function housePayoutForDigit(digit: number, bets: EngineBet[]): number {
+  let total = 0;
+  for (const b of bets) total += payoutForBet(b.selection, b.amount, digit);
+  return total;
+}
+
+export interface PredictionDecision {
+  digit: number;
+  colors: ColorKey[];
+  winningNumber: number;
+  heavyDigit: number;
+  mode: DecisionMode;
+}
+
+export interface PredictionForced {
+  /** Force a winning colour (cheapest matching digit is chosen) … */
+  color?: ColorKey;
+  /** … or force an exact digit. */
+  digit?: number;
+}
+
+export function decidePredictionResult(opts: {
+  bets: EngineBet[];
+  serverSeed: string;
+  period: bigint | number;
+  heavyWinRate?: number;
+  forced?: PredictionForced | null;
+}): PredictionDecision {
+  const rng = createSeededRng(`${opts.serverSeed}:prediction:${opts.period}`);
+  const heavyWinRate = opts.heavyWinRate ?? DEFAULT_HEAVY_WIN_RATE;
+  const bets = opts.bets;
+
+  const priced = ALL_DIGITS.map((d) => ({ digit: d, payout: housePayoutForDigit(d, bets) }));
+  let heavy = priced[0];
+  for (const p of priced) if (p.payout > heavy.payout) heavy = p;
+
+  const done = (digit: number, mode: DecisionMode): PredictionDecision => ({
+    digit,
+    colors: colorsOfDigit(digit),
+    winningNumber: digit,
+    heavyDigit: heavy.digit,
+    mode,
+  });
+
+  // Admin override.
+  if (opts.forced && (opts.forced.color || opts.forced.digit != null)) {
+    if (opts.forced.digit != null) {
+      return done(((opts.forced.digit % 10) + 10) % 10, "FORCED");
+    }
+    // Force a colour → pick the cheapest digit that colour wins on.
+    const cand = ALL_DIGITS.filter((d) => colorsOfDigit(d).includes(opts.forced!.color!));
+    cand.sort((a, b) => housePayoutForDigit(a, bets) - housePayoutForDigit(b, bets));
+    return done(cand[0], "FORCED");
+  }
+
+  const anyBets = bets.some((b) => b.amount > 0);
+  if (!anyBets) return done(Math.floor(rng() * 10), "NO_BETS");
+
+  if (rng() < heavyWinRate) return done(heavy.digit, "HEAVY_WIN");
+
+  // Heavy loses: pick a cheaper digit, inversely weighted to its payout.
+  const lighter = priced.filter((p) => p.digit !== heavy.digit);
+  const weights = lighter.map((p) => 1 / (p.payout + WEIGHT_SMOOTH));
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = rng() * total;
+  let chosen = lighter[lighter.length - 1];
+  for (let i = 0; i < lighter.length; i++) {
+    r -= weights[i];
+    if (r <= 0) {
+      chosen = lighter[i];
+      break;
+    }
+  }
+  return done(chosen.digit, "HEAVY_LOSE");
+}
