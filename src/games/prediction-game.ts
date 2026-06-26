@@ -33,10 +33,10 @@ const MODE_SECONDS_KEY: Record<PredictionMode, string> = {
   EMERD: "emerd_round_seconds",
 };
 const MODE_DEFAULT_SECONDS: Record<PredictionMode, number> = {
-  PARITY: 60,
+  PARITY: 180,
   SAPRE: 180,
   BCONE: 180,
-  EMERD: 300,
+  EMERD: 180,
 };
 
 async function config(mode: PredictionMode): Promise<{ roundMs: number; lockMs: number }> {
