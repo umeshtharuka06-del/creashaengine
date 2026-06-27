@@ -25,6 +25,8 @@ model User {
   isAdmin      Boolean  @default(false)
   isBanned     Boolean  @default(false)
   clientSeed   String   @default("")
+  // Kept in sync with the website schema (referral persistence). Engine unused.
+  referredBy   String?  @db.ObjectId
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -90,6 +92,9 @@ model Bet {
   roundId   String   @db.ObjectId
   game      String
   amount    Int
+  // House fee on the stake; effectiveBet (= amount - feeAmount) drives payouts.
+  feeAmount    Int   @default(0)
+  effectiveBet Int   @default(0)
   selection String
   cashoutX  Int?
   status    String   @default("PENDING")
@@ -117,6 +122,19 @@ model Setting {
   key       String   @id @map("_id")
   value     String
   updatedAt DateTime @updatedAt
+}
+
+// House fee ledger (kept in sync with the website schema). Engine reads bets'
+// effectiveBet at settlement; rows here are written by the website at bet time.
+model HouseTransaction {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  betId     String   @db.ObjectId
+  userId    String   @db.ObjectId
+  game      String
+  fee       Int
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 model AuditLog {

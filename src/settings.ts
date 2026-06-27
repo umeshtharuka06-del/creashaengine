@@ -20,6 +20,10 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   prediction_lock_seconds: "5",
   crash_betting_seconds: "8",
   crash_house_edge_pct: "1",
+  crash_auto_cashout_enabled: "true",
+  house_fee_enabled: "true",
+  house_fee_type: "percentage",
+  house_fee_value: "2",
   prediction_heavy_win_rate: "0.4",
 };
 

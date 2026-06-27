@@ -92,9 +92,12 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
   const heavyWinRate = (await getSettingNumber("prediction_heavy_win_rate")) || 0.4;
 
   for (const round of due) {
+    // Settlement and the house optimizer both price on the EFFECTIVE (post-fee)
+    // stake so exposure matches what is actually paid out. Legacy bets (no fee
+    // recorded) fall back to the gross amount.
     const engineBets: EngineBet[] = round.bets.map((b) => ({
       selection: b.selection,
-      amount: b.amount,
+      amount: b.effectiveBet > 0 ? b.effectiveBet : b.amount,
     }));
     let forced: PredictionForced | null = null;
     if (round.forcedResult) {
@@ -121,7 +124,8 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
 
         for (const bet of round.bets) {
           if (bet.status !== "PENDING") continue;
-          const payout = payoutForBet(bet.selection, bet.amount, res.digit);
+          const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
+          const payout = payoutForBet(bet.selection, stake, res.digit);
           if (payout > 0) {
             await tx.bet.update({
               where: { id: bet.id },

@@ -93,7 +93,8 @@ export async function settleDueCrashRounds() {
           if (bet.status !== "PENDING") continue; // CASHED already credited
           const autoX = parseInt(bet.selection, 10) || 0;
           if (autoX >= 101 && autoX <= crashX) {
-            const payout = Math.floor((bet.amount * autoX) / 100);
+            const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
+            const payout = Math.floor((stake * autoX) / 100);
             await tx.bet.update({
               where: { id: bet.id },
               data: { status: "CASHED", cashoutX: autoX, payout },
