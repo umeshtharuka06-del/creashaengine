@@ -1,0 +1,11 @@
+# /etc/systemd/system/royal1-monitor.service
+# Installed by deploy/install-systemd.sh. Triggered by royal1-monitor.timer.
+[Unit]
+Description=Royal 1 system monitor (CPU/memory/disk/container health)
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/royal1
+ExecStart=/opt/royal1/deploy/monitoring/system-monitor.sh
+Nice=10

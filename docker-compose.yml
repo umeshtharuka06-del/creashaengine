@@ -1,0 +1,287 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Royal 1 — PRODUCTION stack (Contabo Ubuntu VPS)
+#
+#   Cloudflare → Nginx (only host-exposed service: 80/443) → Docker Compose:
+#       web              Next.js (Container 1)
+#       telegram-worker  outbound Telegram notifications (Container 2)
+#       deposit-scanner  TRC20 USDT deposit poller — replaces Vercel Cron (Container 3)
+#       withdraw-queue   withdrawal-request dispatch (Container 4)
+#       redis            job queue (Container 5)
+#       mongo            local DB — optional, profile: local-db; Atlas otherwise (Container 6)
+#       watchtower       auto-update running containers (Container 7)
+#       engine           results/settlement engine (engine-royal)
+#       nginx / certbot  edge TLS termination + Let's Encrypt
+#
+# Rules enforced here:
+#   • ONLY nginx publishes host ports (80/443). Everything else is internal.
+#   • Services talk over the `appnet` bridge using SERVICE NAMES, never localhost.
+#     (localhost in a healthcheck is the container probing ITSELF — that is correct
+#     and is not inter-container traffic.)
+#
+#   cp .env.production.example .env.production   # fill in secrets
+#   docker compose build && docker compose up -d
+#   docker compose --profile local-db up -d      # to also run the bundled Mongo
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Reusable fragments ──────────────────────────────────────────────────────
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    tag: "{{.Name}}"           # structured per-container log tag
+
+x-app-resources: &app-resources
+  resources:
+    limits: { cpus: "0.50", memory: 320M }
+    reservations: { cpus: "0.10", memory: 96M }
+
+# Common config for the app image (built once, reused by web + workers).
+x-app: &app
+  image: royal1-app:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env.production
+  restart: unless-stopped
+  networks: [appnet]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  stop_grace_period: 30s
+  logging: *logging
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  # ── Container 1 — Next.js web ──────────────────────────────────────────────
+  web:
+    <<: *app
+    container_name: royal1-web
+    command: ["npm", "run", "start"]
+    expose:
+      - "3000"               # internal only — reached by nginx as http://web:3000
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 768M }
+        reservations: { cpus: "0.25", memory: 256M }
+
+  # ── Container 2 — Telegram worker ──────────────────────────────────────────
+  telegram-worker:
+    <<: *app
+    container_name: royal1-telegram-worker
+    command: ["npm", "run", "worker:telegram"]
+    environment:
+      TELEGRAM_HEALTH_PORT: "4101"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4101/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      <<: *app-resources
+
+  # ── Container 3 — Deposit scanner (replaces Vercel Cron) ───────────────────
+  deposit-scanner:
+    <<: *app
+    container_name: royal1-deposit-scanner
+    command: ["npm", "run", "worker:deposit"]
+    environment:
+      DEPOSIT_HEALTH_PORT: "4102"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4102/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      <<: *app-resources
+
+  # ── Container 4 — Withdraw queue ───────────────────────────────────────────
+  withdraw-queue:
+    <<: *app
+    container_name: royal1-withdraw-queue
+    command: ["npm", "run", "worker:withdraw"]
+    environment:
+      WITHDRAW_HEALTH_PORT: "4103"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4103/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      <<: *app-resources
+
+  # ── Container 8 — Results Engine (engine-royal — independent service) ───────
+  # Settles due rounds + ensures upcoming rounds exist, sharing the same MongoDB
+  # as the website (no HTTP coupling). Built from its own unchanged context; this
+  # block only integrates it into the stack — the engine code is untouched.
+  engine:
+    image: royal1-engine:latest
+    build:
+      context: ./engine-royal
+      dockerfile: Dockerfile
+    container_name: royal1-engine
+    env_file: .env.production
+    environment:
+      ENGINE_INTERVAL: "${ENGINE_INTERVAL:-1000}"
+      HEALTH_PORT: "4000"
+    restart: unless-stopped
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+    deploy:
+      resources:
+        limits: { cpus: "0.75", memory: 384M }
+        reservations: { cpus: "0.10", memory: 96M }
+
+  # ── Container 5 — Redis (job queue) ────────────────────────────────────────
+  # No eviction policy: this is a durable job queue, not a cache — never drop jobs.
+  redis:
+    image: redis:7-alpine
+    container_name: royal1-redis
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - redis-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks: [appnet]
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *logging
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+        reservations: { cpus: "0.10", memory: 64M }
+
+  # ── Nginx reverse proxy (the ONLY host-exposed service) ────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: royal1-nginx
+    restart: unless-stopped
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+      - nginx-cache:/var/cache/nginx
+    networks: [appnet]
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 128M }
+        reservations: { cpus: "0.10", memory: 32M }
+
+  # ── Certbot (Let's Encrypt renewal) ────────────────────────────────────────
+  certbot:
+    image: certbot/certbot:latest
+    container_name: royal1-certbot
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging: *logging
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+        reservations: { cpus: "0.05", memory: 32M }
+
+  # ── Container 7 — Watchtower (auto-update) ─────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: royal1-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["--cleanup", "--interval", "300", "--label-enable"]
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+        reservations: { cpus: "0.05", memory: 32M }
+
+  # ── Container 6 — MongoDB (optional local DB; Atlas is the default) ────────
+  # Enabled only with:  docker compose --profile local-db up -d
+  # Betting/wallet transactions require a REPLICA SET — started with --replSet rs0;
+  # run `rs.initiate()` once (see deploy notes).
+  mongo:
+    image: mongo:7
+    container_name: royal1-mongo
+    profiles: ["local-db"]
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo-data:/data/db
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 1024M }
+        reservations: { cpus: "0.25", memory: 512M }
+
+networks:
+  appnet:
+    driver: bridge
+
+volumes:
+  redis-data:
+  mongo-data:
+  nginx-cache:
