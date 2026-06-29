@@ -26,12 +26,15 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 fi
 
 echo "==> Ensuring runtime directories"
-mkdir -p certbot/conf certbot/www backups nginx/logs
+# TLS certs + ACME webroot now live in Docker named volumes (letsencrypt /
+# certbot-www), not host paths — nothing to create for nginx here.
+mkdir -p backups
 
 echo "==> Pulling base images"
-${COMPOSE} pull redis nginx certbot watchtower || true
+# nginx is a locally-built image (royal1-nginx) — not pulled from a registry.
+${COMPOSE} pull redis certbot watchtower || true
 
-echo "==> Building application image"
+echo "==> Building application + nginx images"
 ${COMPOSE} build
 
 echo "==> Validating environment (fail-fast on missing/insecure secrets)"

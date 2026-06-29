@@ -1,62 +1,43 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Royal 1 — first-time Let's Encrypt bootstrap (handles the nginx chicken-and-egg).
+# Royal 1 — first-time Let's Encrypt bootstrap.
 #
-# The :443 server references a certificate + dhparam that don't exist on a fresh
-# box, so nginx can't start to serve the ACME challenge. This script:
-#   1. generates dhparam.pem,
-#   2. installs a temporary self-signed cert so nginx can boot,
-#   3. starts nginx, runs certbot webroot to get the REAL cert,
-#   4. reloads nginx.
+# The nginx image already seeds a temporary self-signed cert into the shared
+# `letsencrypt` volume on first boot (see nginx/docker-entrypoint.d/), so nginx
+# is already running and serving the ACME http-01 challenge on :80. This script
+# just replaces that bootstrap cert with a REAL one and reloads nginx.
+#
+# Certs live in the `letsencrypt` Docker NAMED VOLUME (shared nginx <-> certbot),
+# NOT on a host path — this is what makes the stack portable under Portainer.
 # Renewals afterwards are automatic (the `certbot` compose service).
 #
-#   DOMAIN=royal1.example.com CERTBOT_EMAIL=you@example.com ./deploy/init-letsencrypt.sh
-#   # or rely on the values in .env.production
+#   DOMAIN=mega99.xyz CERTBOT_EMAIL=you@example.com ./deploy/init-letsencrypt.sh
+#   # or rely on the values in .env
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
-DOMAIN="${DOMAIN:?Set DOMAIN (e.g. royal1.example.com)}"
+DOMAIN="${DOMAIN:?Set DOMAIN (e.g. mega99.xyz)}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:?Set CERTBOT_EMAIL}"
 STAGING="${STAGING:-0}"   # STAGING=1 to test against Let's Encrypt staging
-
-CONF_DIR="./certbot/conf"
-WWW_DIR="./certbot/www"
-LIVE_DIR="${CONF_DIR}/live/${DOMAIN}"
 COMPOSE="docker compose"
 
-mkdir -p "${WWW_DIR}" "${LIVE_DIR}"
-
-# 1) dhparam (referenced by nginx/snippets/ssl-params.conf).
-if [[ ! -s "${CONF_DIR}/dhparam.pem" ]]; then
-  echo "==> Generating dhparam (2048-bit, ~1 min)"
-  openssl dhparam -out "${CONF_DIR}/dhparam.pem" 2048
-fi
-
-# 2) Temporary self-signed cert so nginx can start.
-if [[ ! -s "${LIVE_DIR}/fullchain.pem" ]]; then
-  echo "==> Creating temporary self-signed certificate for ${DOMAIN}"
-  openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
-    -keyout "${LIVE_DIR}/privkey.pem" \
-    -out "${LIVE_DIR}/fullchain.pem" \
-    -subj "/CN=${DOMAIN}"
-fi
-
-echo "==> Starting nginx"
+# 1) Make sure nginx is up (it self-seeds a bootstrap cert and serves :80 ACME).
+echo "==> Ensuring nginx is running (serves the ACME challenge on :80)"
 ${COMPOSE} up -d nginx
 
-# 3) Replace the dummy cert with a real one via the webroot challenge.
-echo "==> Requesting Let's Encrypt certificate for ${DOMAIN}"
+# 2) Request the real certificate via the webroot challenge into the shared volume.
+echo "==> Requesting Let's Encrypt certificate for ${DOMAIN} (+ www.${DOMAIN})"
 STAGING_FLAG=""; [[ "${STAGING}" == "1" ]] && STAGING_FLAG="--staging"
-rm -rf "${LIVE_DIR}"   # let certbot create the real live dir cleanly
 ${COMPOSE} run --rm --entrypoint certbot certbot \
   certonly --webroot -w /var/www/certbot \
   ${STAGING_FLAG} \
   --email "${CERTBOT_EMAIL}" --agree-tos --no-eff-email \
-  --force-renewal -d "${DOMAIN}"
+  --force-renewal \
+  -d "${DOMAIN}" -d "www.${DOMAIN}"
 
-# 4) Reload nginx with the real certificate.
+# 3) Reload nginx so it serves the real certificate.
 echo "==> Reloading nginx"
 ${COMPOSE} exec nginx nginx -s reload
 

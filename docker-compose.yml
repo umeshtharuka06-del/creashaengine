@@ -180,8 +180,16 @@ services:
     logging: *logging
 
   # ── Nginx reverse proxy (the ONLY host-exposed service) ────────────────────
+  # Config (conf.d + snippets) is BAKED INTO the image — see nginx/Dockerfile.
+  # It is NOT bind-mounted, because relative host bind mounts (./nginx/conf.d)
+  # resolve to an empty auto-created dir under Portainer Git/Web-editor stacks,
+  # leaving /etc/nginx/conf.d empty and the site unreachable. Only runtime state
+  # (TLS certs, ACME webroot, proxy cache) uses volumes.
   nginx:
-    image: nginx:1.27-alpine
+    image: royal1-nginx:latest
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
     container_name: royal1-nginx
     restart: unless-stopped
     depends_on:
@@ -190,14 +198,10 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./nginx/snippets:/etc/nginx/snippets:ro
-      - ./certbot/conf:/etc/letsencrypt:ro
-      - ./certbot/www:/var/www/certbot:ro
+      - letsencrypt:/etc/letsencrypt        # cert store, shared with certbot (rw: entrypoint seeds a bootstrap cert)
+      - certbot-www:/var/www/certbot:ro      # ACME http-01 webroot, shared with certbot
       - nginx-cache:/var/cache/nginx
     networks: [appnet]
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
@@ -217,8 +221,8 @@ services:
     container_name: royal1-certbot
     restart: unless-stopped
     volumes:
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot
+      - letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
     entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
     labels:
       com.centurylinklabs.watchtower.enable: "true"
@@ -273,3 +277,5 @@ volumes:
   redis-data:
   mongo-data:
   nginx-cache:
+  letsencrypt:     # TLS certs, shared by nginx + certbot (replaces ./certbot/conf host bind)
+  certbot-www:     # ACME http-01 webroot, shared by nginx + certbot (replaces ./certbot/www host bind)
