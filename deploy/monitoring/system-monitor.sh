@@ -14,7 +14,7 @@ set -euo pipefail
 
 # Load deployment env if present (for thresholds + alert creds).
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-[[ -f "${ROOT}/.env.production" ]] && { set -a; . "${ROOT}/.env.production"; set +a; }
+[[ -f "${ROOT}/.env" ]] && { set -a; . "${ROOT}/.env"; set +a; }
 
 CPU_MAX=${CPU_MAX:-90}
 MEM_MAX=${MEM_MAX:-90}

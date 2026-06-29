@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [[ -f .env.production ]]; then set -a; . ./.env.production; set +a; fi
+if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
 DOMAIN="${DOMAIN:?Set DOMAIN (e.g. royal1.example.com)}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:?Set CERTBOT_EMAIL}"
 STAGING="${STAGING:-0}"   # STAGING=1 to test against Let's Encrypt staging
@@ -24,7 +24,7 @@ STAGING="${STAGING:-0}"   # STAGING=1 to test against Let's Encrypt staging
 CONF_DIR="./certbot/conf"
 WWW_DIR="./certbot/www"
 LIVE_DIR="${CONF_DIR}/live/${DOMAIN}"
-COMPOSE="docker compose --env-file .env.production"
+COMPOSE="docker compose"
 
 mkdir -p "${WWW_DIR}" "${LIVE_DIR}"
 

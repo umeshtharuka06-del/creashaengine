@@ -11,15 +11,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-ENV_FILE=".env.production"
-COMPOSE="docker compose --env-file ${ENV_FILE}"
+# The compose file interpolates ${VAR} from the default `.env` file, so the
+# stack also starts with a bare `docker compose up -d`. Keep secrets in `.env`.
+ENV_FILE=".env"
+COMPOSE="docker compose"
 
 if [[ "${1:-}" == "local-db" ]]; then
   COMPOSE="${COMPOSE} --profile local-db"
 fi
 
 if [[ ! -f "${ENV_FILE}" ]]; then
-  echo "ERROR: ${ENV_FILE} not found. Copy it from .env.production.example and fill in secrets." >&2
+  echo "ERROR: ${ENV_FILE} not found. Run:  cp .env.production.example .env  and fill in secrets." >&2
   exit 1
 fi
 

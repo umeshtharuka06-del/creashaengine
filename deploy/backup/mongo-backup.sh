@@ -14,7 +14,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${ROOT}"
-[[ -f .env.production ]] && { set -a; . ./.env.production; set +a; }
+[[ -f .env ]] && { set -a; . ./.env; set +a; }
 
 : "${DATABASE_URL:?DATABASE_URL is required (set it in .env.production)}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"

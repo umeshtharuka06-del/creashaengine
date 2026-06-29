@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${ROOT}"
-[[ -f .env.production ]] && { set -a; . ./.env.production; set +a; }
+[[ -f .env ]] && { set -a; . ./.env; set +a; }
 
 ARCHIVE="${1:-}"
 : "${DATABASE_URL:?DATABASE_URL is required}"
