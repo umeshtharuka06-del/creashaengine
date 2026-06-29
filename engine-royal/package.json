@@ -1,0 +1,26 @@
+{
+  "name": "engine-royal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Royal 1 — standalone result/settlement engine (runs on a VPS, shares the website's MongoDB).",
+  "type": "module",
+  "scripts": {
+    "worker": "tsx scripts/settle-worker.ts",
+    "create-rounds": "tsx scripts/create-rounds.ts",
+    "process-rounds": "tsx scripts/process-rounds.ts",
+    "build": "prisma generate && tsc --noEmit",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

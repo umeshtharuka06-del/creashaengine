@@ -1,0 +1,52 @@
+# ── Royal 1 engine — production Docker Compose (Portainer-friendly) ────────
+# No .env file is required. Supply variables as Portainer STACK ENVIRONMENT
+# VARIABLES (Stacks → your stack → Environment variables), or with `docker
+# compose` from the shell environment. Anything not set falls back to the
+# defaults below, so the container starts even with no local .env.
+#
+# The ONLY value you must provide is DATABASE_URL (the shared MongoDB).
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: royal-engine:latest
+    container_name: royal-engine
+    restart: always
+    # All config comes from stack/shell env with safe defaults — no env_file.
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: ${DATABASE_URL:-}
+      JWT_SECRET: ${JWT_SECRET:-}
+      FAIR_SECRET: ${FAIR_SECRET:-}
+      ENGINE_INTERVAL: ${ENGINE_INTERVAL:-1000}
+      HEALTH_PORT: ${HEALTH_PORT:-4000}
+    ports:
+      - "${HEALTH_PORT:-4000}:${HEALTH_PORT:-4000}"
+    # Named volume (not a host bind path) so Portainer git/stack deploys work.
+    volumes:
+      - engine-logs:/app/logs
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:'+(process.env.HEALTH_PORT||4000)+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  engine-logs:
