@@ -83,19 +83,27 @@ export function usePredictionMode(
     const serverMs = () => Date.now() + offsetRef.current;
 
     const loop = async () => {
-      await fetchNow();
-      if (stopped) return;
-      const d = dataRef.current;
+      // try/finally guarantees the NEXT poll is always scheduled. Previously a
+      // single rejected fetch killed this recursive setTimeout for good, freezing
+      // the history on whatever period was last seen until the page remounted —
+      // which is exactly the "stuck history, only a refresh fixes it" symptom.
       let delay = 1500;
-      if (d?.round) {
-        const settleLeft = new Date(d.round.settleAt).getTime() - serverMs();
-        const lockLeft = new Date(d.round.lockAt).getTime() - serverMs();
-        if (settleLeft <= 2500 || (lockLeft <= 0 && settleLeft > 0)) delay = 400;
-        else if (settleLeft <= 6000) delay = 900;
-      } else {
-        delay = 700; // round not opened yet — check back soon
+      try {
+        await fetchNow();
+        const d = dataRef.current;
+        if (d?.round) {
+          const settleLeft = new Date(d.round.settleAt).getTime() - serverMs();
+          const lockLeft = new Date(d.round.lockAt).getTime() - serverMs();
+          if (settleLeft <= 2500 || (lockLeft <= 0 && settleLeft > 0)) delay = 400;
+          else if (settleLeft <= 6000) delay = 900;
+        } else {
+          delay = 700; // round not opened yet — check back soon
+        }
+      } catch {
+        delay = 1000; // transient error — back off briefly, then keep polling
+      } finally {
+        if (!stopped) timer = setTimeout(loop, delay);
       }
-      timer = setTimeout(loop, delay);
     };
 
     loop();
