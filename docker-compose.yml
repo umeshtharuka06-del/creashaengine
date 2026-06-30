@@ -209,21 +209,73 @@ services:
     mem_reservation: 32m
     stop_grace_period: 15s
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      # busybox wget (alpine) does not reliably support --spider; -O /dev/null
+      # is portable and still fails the check on any non-2xx response.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/healthz"]
       interval: 30s
       timeout: 5s
       retries: 5
+      start_period: 15s
     logging: *logging
 
-  # ── Certbot (Let's Encrypt renewal) ────────────────────────────────────────
+  # ── Certbot (Let's Encrypt: initial issuance + auto-renewal) ───────────────
   certbot:
     image: certbot/certbot:latest
     container_name: royal1-certbot
     restart: unless-stopped
+    depends_on:
+      - nginx
+    environment:
+      DOMAIN: ${DOMAIN:-mega99.xyz}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-}
+      STAGING: ${STAGING:-0}
     volumes:
       - letsencrypt:/etc/letsencrypt
       - certbot-www:/var/www/certbot
-    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
+    # On first boot, if no Certbot-managed cert exists yet, request a REAL
+    # Let's Encrypt cert via the http-01 webroot (nginx already serves :80 +
+    # the bootstrap self-signed cert), replacing the temporary cert and
+    # signalling nginx to reload. Afterwards, renew every 12h; the --deploy-hook
+    # re-signals nginx so renewed certs are picked up without a restart.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        DOMAIN="$${DOMAIN:-mega99.xyz}"
+        EMAIL="$${CERTBOT_EMAIL:-}"
+        STAGING_FLAG=""
+        if [ "$${STAGING:-0}" = "1" ]; then STAGING_FLAG="--staging"; fi
+        RENEWAL="/etc/letsencrypt/renewal/$${DOMAIN}.conf"
+        trap exit TERM
+        # Give nginx a moment to bind :80 (it serves the http-01 challenge).
+        sleep 10
+        while :; do
+          if [ -f "$${RENEWAL}" ]; then
+            # Real cert already managed by Certbot — keep it renewed (12h cadence).
+            certbot renew --webroot -w /var/www/certbot --quiet \
+              --deploy-hook "touch /etc/letsencrypt/.reload"
+            sleep 12h & wait $${!}
+          elif [ -n "$${EMAIL}" ]; then
+            # No managed cert yet — replace the bootstrap self-signed cert with a
+            # real Let's Encrypt one. Drop the seeded dummy first so Certbot writes
+            # a clean lineage at the path royal1.conf references.
+            echo "[certbot] Requesting Let's Encrypt certificate for $${DOMAIN}"
+            rm -rf "/etc/letsencrypt/live/$${DOMAIN}" "/etc/letsencrypt/archive/$${DOMAIN}" "$${RENEWAL}"
+            if certbot certonly --webroot -w /var/www/certbot \
+                 --non-interactive --agree-tos --no-eff-email \
+                 --email "$${EMAIL}" $${STAGING_FLAG} \
+                 -d "$${DOMAIN}" -d "www.$${DOMAIN}"; then
+              echo "[certbot] Issued real certificate; signalling nginx to reload"
+              touch /etc/letsencrypt/.reload
+            else
+              echo "[certbot] Issuance failed (DNS/ACME not ready?); retrying in 15m"
+              sleep 15m & wait $${!}
+            fi
+          else
+            echo "[certbot] CERTBOT_EMAIL not set; staying on bootstrap self-signed cert"
+            sleep 12h & wait $${!}
+          fi
+        done
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     mem_limit: 128m

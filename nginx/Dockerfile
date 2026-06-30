@@ -23,9 +23,12 @@ RUN apk add --no-cache openssl
 COPY conf.d/   /etc/nginx/conf.d/
 COPY snippets/ /etc/nginx/snippets/
 
-# Self-signed bootstrap cert seeder (runs before nginx starts).
-COPY docker-entrypoint.d/10-seed-selfsigned-cert.sh /docker-entrypoint.d/10-seed-selfsigned-cert.sh
-RUN chmod +x /docker-entrypoint.d/10-seed-selfsigned-cert.sh
+# Entrypoint hooks (run by the stock nginx entrypoint before nginx starts):
+#   10-seed-selfsigned-cert.sh  — bootstrap self-signed cert so :443 can bind
+#   20-reload-on-cert-change.sh — background reloader that picks up the real cert
+COPY docker-entrypoint.d/ /docker-entrypoint.d/
+RUN chmod +x /docker-entrypoint.d/10-seed-selfsigned-cert.sh \
+             /docker-entrypoint.d/20-reload-on-cert-change.sh
 
 # Domain used by the seeder + referenced cert paths in royal1.conf.
 ENV DOMAIN=mega99.xyz
