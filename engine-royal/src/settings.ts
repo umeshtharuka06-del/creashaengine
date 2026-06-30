@@ -35,6 +35,10 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   crypto_confirmations: "20",
   crypto_poll_seconds: "30",
   prediction_heavy_win_rate: "0.4",
+  // Single-player colour fairness (engine-only; see prediction-engine.ts).
+  // Applied ONLY when a colour round has exactly one distinct player.
+  single_player_color_win_rate: "0.4", // target colour win-rate for the lone player
+  single_player_color_max_payout: "0", // coin-cents affordability cap (0 = no cap)
 };
 
 export async function getSetting(key: string): Promise<string> {

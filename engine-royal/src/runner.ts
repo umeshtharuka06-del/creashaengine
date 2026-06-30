@@ -15,12 +15,25 @@ import { log } from "./logger";
 // settlement-worker architecture below is exactly as before; only the set of
 // games it iterates over was extended.
 
+/**
+ * Run `fn` and swallow+log any throw so one game's failure can never starve the
+ * others in the same tick. Each game is independent; a transient DB error on one
+ * mode must not stop the remaining modes (or crash) from settling/advancing.
+ */
+async function isolate(label: string, fn: () => Promise<unknown>) {
+  try {
+    await fn();
+  } catch (e) {
+    log.error(`${label}.failed`, { error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
 /** Settle every due round across all prediction modes + crash. */
 export async function processAllRounds() {
   for (const mode of PREDICTION_MODES) {
-    await settleDuePredictionRounds(mode);
+    await isolate(`settle.${mode}`, () => settleDuePredictionRounds(mode));
   }
-  await settleDueCrashRounds();
+  await isolate("settle.CRASH", () => settleDueCrashRounds());
 }
 
 /**
@@ -30,9 +43,9 @@ export async function processAllRounds() {
  */
 export async function createAllRounds() {
   for (const mode of PREDICTION_MODES) {
-    await ensureCurrentPredictionRound(mode);
+    await isolate(`ensure.${mode}`, () => ensureCurrentPredictionRound(mode));
   }
-  await ensureCurrentCrashRound();
+  await isolate("ensure.CRASH", () => ensureCurrentCrashRound());
 }
 
 /** One full engine tick: settle what is due, then ensure the next rounds exist. */

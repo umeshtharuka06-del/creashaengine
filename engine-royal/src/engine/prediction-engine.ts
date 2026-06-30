@@ -362,12 +362,101 @@ export interface PredictionForced {
   digit?: number;
 }
 
+/** True only for the single-character digit selections "0".."9". */
+function digitOf(selection: string): number | null {
+  if (!/^[0-9]$/.test(selection)) return null;
+  return Number(selection);
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ *  SINGLE-PLAYER COLOUR FAIRNESS  (an IMPROVEMENT to the house-edge system,
+ *  not a replacement). Active ONLY when exactly one unique player is in the
+ *  round AND that player has at least one COLOUR bet. Multiplayer rounds and
+ *  number-only rounds never reach here — they keep the standard house optimiser
+ *  below, so multiplayer behaviour is byte-for-byte unchanged.
+ *
+ *  Behaviour for the lone colour-betting player:
+ *   • ~`rate` (default 0.40) of rounds the chosen digit MATCHES one of their
+ *     colours (a fairness win); otherwise an opposite colour wins.
+ *   • Number bets are NEVER intentionally matched — candidate digits exclude the
+ *     player's number selections whenever an alternative exists.
+ *   • If the player covered ALL 10 numbers (a guaranteed number win) plus a
+ *     colour, the colour is forced to LOSE (opposite colour, random digit) so a
+ *     colour win never stacks on top of the all-numbers cover.
+ *   • House profit stays the priority: an optional `maxWinPayout` cap suppresses
+ *     the fairness win on any round the house cannot safely afford.
+ *  Everything is drawn from the seeded round RNG, so it is reproducible/auditable
+ *  and contains no fixed sequence.
+ * ─────────────────────────────────────────────────────────────────────────── */
+function decideSinglePlayerColor(opts: {
+  bets: EngineBet[];
+  rate: number;
+  rng: () => number;
+  maxWinPayout: number; // coin-cents; <= 0 disables the affordability cap
+}): { digit: number; mode: DecisionMode } | null {
+  const { bets, rate, rng, maxWinPayout } = opts;
+
+  const colorSel = new Set<ColorKey>();
+  const numberSel = new Set<number>();
+  for (const b of bets) {
+    if (isColorKey(b.selection)) colorSel.add(b.selection);
+    else {
+      const d = digitOf(b.selection);
+      if (d != null) numberSel.add(d);
+    }
+  }
+  // Nothing in our option space → defer to the standard optimiser.
+  if (colorSel.size === 0 && numberSel.size === 0) return null;
+
+  const colorWins = (d: number) => colorsOfDigit(d).some((c) => colorSel.has(c));
+  const pick = (pool: number[]) => pool[Math.floor(rng() * pool.length)];
+
+  // Edge case: all 10 numbers covered (a guaranteed number win). The number win
+  // is unavoidable; we only ensure the COLOUR does not also win. With a colour
+  // bet → force the opposite colour; otherwise any random digit.
+  if (numberSel.size >= 10) {
+    const pool = colorSel.size ? ALL_DIGITS.filter((d) => !colorWins(d)) : ALL_DIGITS;
+    return { digit: pick(pool.length ? pool : ALL_DIGITS), mode: "HEAVY_LOSE" };
+  }
+
+  // Number-only lone player: fairness is colour-only, and we must NOT intentionally
+  // generate their numbers — so pick a digit they did NOT select (house keeps the
+  // edge). This deliberately removes the legacy heavy-win that would otherwise hand
+  // a lone number bettor their 9× number ~`rate` of the time.
+  if (colorSel.size === 0) {
+    const avoid = ALL_DIGITS.filter((d) => !numberSel.has(d));
+    return { digit: pick(avoid.length ? avoid : ALL_DIGITS), mode: "HEAVY_LOSE" };
+  }
+
+  // Prefer digits that don't also hand the player one of their number bets.
+  const winPool = ALL_DIGITS.filter((d) => colorWins(d) && !numberSel.has(d));
+  const losePool = ALL_DIGITS.filter((d) => !colorWins(d) && !numberSel.has(d));
+  const winFallback = ALL_DIGITS.filter((d) => colorWins(d));
+  const loseFallback = ALL_DIGITS.filter((d) => !colorWins(d));
+  const affordable = (d: number) =>
+    maxWinPayout <= 0 || housePayoutForDigit(d, bets) <= maxWinPayout;
+
+  if (rng() < rate) {
+    const pool = (winPool.length ? winPool : winFallback).filter(affordable);
+    if (pool.length) return { digit: pick(pool), mode: "HEAVY_WIN" };
+    // House can't safely afford a win this round → fall through to a loss.
+  }
+  const lose = losePool.length ? losePool : loseFallback.length ? loseFallback : ALL_DIGITS;
+  return { digit: pick(lose), mode: "HEAVY_LOSE" };
+}
+
 export function decidePredictionResult(opts: {
   bets: EngineBet[];
   serverSeed: string;
   period: bigint | number;
   heavyWinRate?: number;
   forced?: PredictionForced | null;
+  /** Distinct user count in the round; enables single-player colour fairness at 1. */
+  uniquePlayers?: number;
+  /** Target colour win-rate for the lone player (default = heavyWinRate). */
+  singleColorWinRate?: number;
+  /** Affordability cap (coin-cents) for a single-player fairness win; 0 = none. */
+  singleColorMaxPayout?: number;
 }): PredictionDecision {
   const rng = createSeededRng(`${opts.serverSeed}:prediction:${opts.period}`);
   const heavyWinRate = opts.heavyWinRate ?? DEFAULT_HEAVY_WIN_RATE;
@@ -398,6 +487,19 @@ export function decidePredictionResult(opts: {
 
   const anyBets = bets.some((b) => b.amount > 0);
   if (!anyBets) return done(Math.floor(rng() * 10), "NO_BETS");
+
+  // ── Single-player colour fairness (improvement; multiplayer untouched) ──
+  // Only when exactly one distinct player is in the round. decideSinglePlayerColor
+  // returns null for number-only lone players, so those keep the house optimiser.
+  if (opts.uniquePlayers === 1) {
+    const single = decideSinglePlayerColor({
+      bets,
+      rate: opts.singleColorWinRate ?? heavyWinRate,
+      rng,
+      maxWinPayout: opts.singleColorMaxPayout ?? 0,
+    });
+    if (single) return done(single.digit, single.mode);
+  }
 
   if (rng() < heavyWinRate) return done(heavy.digit, "HEAVY_WIN");
 

@@ -72,38 +72,84 @@ async function promoteState(r: { id: string; state: string; startAt: Date }) {
   return prisma.gameRound.findUniqueOrThrow({ where: { id: r.id } });
 }
 
+/**
+ * Settle every due crash round, oldest first. Same recovery/resilience/idempotency
+ * guarantees as prediction settlement: missed settlements are re-picked next tick,
+ * a single unpayable bet can't poison the round, and the in-transaction round re-read
+ * + SETTLED flip prevents duplicate payouts from overlapping ticks.
+ */
 export async function settleDueCrashRounds() {
+  const now = new Date();
   const due = await prisma.gameRound.findMany({
-    where: { game: GAME, state: { in: ["BETTING", "RUNNING"] }, settleAt: { lte: new Date() } },
+    where: { game: GAME, state: { in: ["BETTING", "RUNNING"] }, settleAt: { lte: now } },
     include: { bets: true },
-    take: 20,
+    orderBy: { settleAt: "asc" },
+    take: 50,
   });
+  if (due.length === 0) return;
+
+  if (due.length > 1) {
+    log.engine("crash.settle.backlog", { dueRounds: due.length });
+  }
 
   for (const round of due) {
-    const parsed = round.result ? JSON.parse(round.result) : { crashX: 100 };
-    const crashX: number = parsed.crashX;
+    // Overdue by >10s means we are recovering a missed settlement, not settling
+    // a just-expired round — surface it.
+    const lateMs = now.getTime() - round.settleAt.getTime();
+    if (lateMs > 10_000) {
+      log.settlement("crash.recovery", {
+        period: round.period.toString(),
+        state: round.state,
+        lateMs,
+        bets: round.bets.length,
+      });
+    }
+
+    let crashX = 100;
+    try {
+      if (round.result) crashX = JSON.parse(round.result).crashX ?? 100;
+    } catch {
+      crashX = 100; // corrupt result blob → treat as instant crash, still settle
+    }
 
     try {
       let didSettle = false;
+      let unpaidWinners = 0;
       await prisma.$transaction(async (tx) => {
-        const fresh = await tx.gameRound.findUnique({ where: { id: round.id } });
+        const fresh = await tx.gameRound.findUnique({
+          where: { id: round.id },
+          include: { bets: true },
+        });
         if (!fresh || fresh.state === "SETTLED") return;
 
-        for (const bet of round.bets) {
+        for (const bet of fresh.bets) {
           if (bet.status !== "PENDING") continue; // CASHED already credited
           const autoX = parseInt(bet.selection, 10) || 0;
           if (autoX >= 101 && autoX <= crashX) {
             const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
             const payout = Math.floor((stake * autoX) / 100);
-            await tx.bet.update({
-              where: { id: bet.id },
-              data: { status: "CASHED", cashoutX: autoX, payout },
-            });
-            await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, {
-              game: GAME,
-              autoX,
-              crashX,
-            });
+            try {
+              await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, {
+                game: GAME,
+                autoX,
+                crashX,
+              });
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: { status: "CASHED", cashoutX: autoX, payout },
+              });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              if (msg === "WALLET_NOT_FOUND") {
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: { status: "LOST", payout: 0 },
+                });
+                unpaidWinners += 1;
+              } else {
+                throw e;
+              }
+            }
           } else {
             await tx.bet.update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } });
           }
@@ -120,6 +166,7 @@ export async function settleDueCrashRounds() {
           period: round.period.toString(),
           crashX,
           bets: round.bets.length,
+          ...(unpaidWinners > 0 ? { unpaidWinners } : {}),
         });
       }
     } catch (e) {

@@ -81,17 +81,61 @@ export async function ensureCurrentPredictionRound(mode: PredictionMode) {
   }
 }
 
-/** Settle every due round of `mode`. Idempotent. */
+/**
+ * Settle every due round of `mode`.
+ *
+ * Guarantees (see ROOT CAUSE notes in the PR):
+ *  • RECOVERY — selects EVERY round whose timer has expired and is not yet
+ *    SETTLED, OLDEST FIRST, so a settlement missed on a previous tick is picked
+ *    up automatically on the next one. No round can stay BETTING after its
+ *    settleAt forever.
+ *  • RESILIENCE — one bad bet can no longer poison the whole round. A winner
+ *    whose wallet is missing is recorded as LOST (and logged) instead of
+ *    aborting the transaction, so the round always reaches SETTLED.
+ *  • IDEMPOTENCY / LOCKING — the round is re-read INSIDE the transaction and
+ *    skipped if already SETTLED, and only PENDING bets are paid. The final
+ *    flip to SETTLED on the round document means two concurrent ticks collide
+ *    on that write (MongoDB WriteConflict aborts the loser), so a duplicate
+ *    tick can never produce a duplicate payout. `bet.status` is the idempotency
+ *    key — a bet is paid at most once because it leaves PENDING in the same
+ *    transaction that credits it.
+ */
 export async function settleDuePredictionRounds(mode: PredictionMode) {
+  const now = new Date();
   const due = await prisma.gameRound.findMany({
-    where: { game: mode, state: { not: "SETTLED" }, settleAt: { lte: new Date() } },
+    where: { game: mode, state: { not: "SETTLED" }, settleAt: { lte: now } },
     include: { bets: true },
-    take: 20,
+    orderBy: { settleAt: "asc" }, // oldest overdue first → drains backlog, no starvation
+    take: 50,
   });
+  if (due.length === 0) return;
 
+  const { roundMs } = await config(mode);
   const heavyWinRate = (await getSettingNumber("prediction_heavy_win_rate")) || 0.4;
+  // Single-player colour fairness knobs (default to the standard 0.4 / no cap).
+  const singleColorWinRate =
+    (await getSettingNumber("single_player_color_win_rate")) || heavyWinRate;
+  const singleColorMaxPayout =
+    (await getSettingNumber("single_player_color_max_payout")) || 0;
+
+  if (due.length > 1) {
+    log.engine("prediction.settle.backlog", { mode, dueRounds: due.length });
+  }
 
   for (const round of due) {
+    // A round overdue by more than one full cycle is a MISSED settlement that we
+    // are now recovering — surface it explicitly for observability.
+    const lateMs = now.getTime() - round.settleAt.getTime();
+    if (lateMs > roundMs) {
+      log.settlement("prediction.recovery", {
+        mode,
+        period: round.period.toString(),
+        state: round.state,
+        lateMs,
+        bets: round.bets.length,
+      });
+    }
+
     // Settlement and the house optimizer both price on the EFFECTIVE (post-fee)
     // stake so exposure matches what is actually paid out. Legacy bets (no fee
     // recorded) fall back to the gross amount.
@@ -99,6 +143,9 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
       selection: b.selection,
       amount: b.effectiveBet > 0 ? b.effectiveBet : b.amount,
     }));
+    // Single-player colour fairness only triggers at exactly one distinct player.
+    const uniquePlayers = new Set(round.bets.map((b) => b.userId)).size;
+
     let forced: PredictionForced | null = null;
     if (round.forcedResult) {
       try {
@@ -114,27 +161,53 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
       period: round.period,
       heavyWinRate,
       forced,
+      uniquePlayers,
+      singleColorWinRate,
+      singleColorMaxPayout,
     });
 
     try {
       let didSettle = false;
+      let unpaidWinners = 0;
       await prisma.$transaction(async (tx) => {
-        const fresh = await tx.gameRound.findUnique({ where: { id: round.id } });
-        if (!fresh || fresh.state === "SETTLED") return;
+        // Re-read the round + bets INSIDE the tx so we act on fresh state and a
+        // concurrent settlement (or an earlier partial attempt) cannot be redone.
+        const fresh = await tx.gameRound.findUnique({
+          where: { id: round.id },
+          include: { bets: true },
+        });
+        if (!fresh || fresh.state === "SETTLED") return; // already settled — idempotent no-op
 
-        for (const bet of round.bets) {
-          if (bet.status !== "PENDING") continue;
+        for (const bet of fresh.bets) {
+          if (bet.status !== "PENDING") continue; // never repay a non-pending bet
           const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
           const payout = payoutForBet(bet.selection, stake, res.digit);
+
           if (payout > 0) {
-            await tx.bet.update({
-              where: { id: bet.id },
-              data: { status: "WON", payout },
-            });
-            await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, {
-              game: mode,
-              digit: res.digit,
-            });
+            try {
+              await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, {
+                game: mode,
+                digit: res.digit,
+              });
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: { status: "WON", payout },
+              });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              if (msg === "WALLET_NOT_FOUND") {
+                // The winner's wallet no longer exists (deleted user / orphaned
+                // bet). There is nobody to credit — record it as LOST so the
+                // round can still settle instead of being stuck forever.
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: { status: "LOST", payout: 0 },
+                });
+                unpaidWinners += 1;
+              } else {
+                throw e; // unexpected/transient → abort tx, retried next tick
+              }
+            }
           } else {
             await tx.bet.update({
               where: { id: bet.id },
@@ -158,6 +231,7 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
         });
         didSettle = true;
       });
+
       if (didSettle) {
         log.settlement("prediction.settled", {
           mode,
@@ -165,10 +239,14 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
           digit: res.digit,
           colors: res.colors,
           decisionMode: res.mode,
+          uniquePlayers,
           bets: round.bets.length,
+          ...(unpaidWinners > 0 ? { unpaidWinners } : {}),
         });
       }
     } catch (e) {
+      // Logged, NOT rethrown: the next tick re-selects this round (recovery),
+      // and a failure here never blocks the other due rounds in this loop.
       log.error("prediction.settle.failed", {
         mode,
         period: round.period.toString(),
