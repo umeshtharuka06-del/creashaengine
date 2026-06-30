@@ -73,107 +73,142 @@ async function promoteState(r: { id: string; state: string; startAt: Date }) {
 }
 
 /**
- * Settle every due crash round, oldest first. Same recovery/resilience/idempotency
- * guarantees as prediction settlement: missed settlements are re-picked next tick,
- * a single unpayable bet can't poison the round, and the in-transaction round re-read
- * + SETTLED flip prevents duplicate payouts from overlapping ticks.
+ * Settle every due crash round, oldest first. Same TWO-PHASE design as prediction
+ * settlement (see prediction-game.ts): a fast atomic CLAIM flips the round to
+ * SETTLED in one conditional write (no wallet I/O — so no 5s transaction-timeout
+ * under load), then payouts drain in bulk (losers) + small idempotent per-winner
+ * transactions. SETTLED rounds with leftover PENDING bets are recovered each tick.
  */
 export async function settleDueCrashRounds() {
   const now = new Date();
   const due = await prisma.gameRound.findMany({
     where: { game: GAME, state: { in: ["BETTING", "RUNNING"] }, settleAt: { lte: now } },
-    include: { bets: true },
     orderBy: { settleAt: "asc" },
     take: 50,
   });
-  if (due.length === 0) return;
+  const laggingPayouts = await prisma.gameRound.findMany({
+    where: { game: GAME, state: "SETTLED", bets: { some: { status: "PENDING" } } },
+    orderBy: { settleAt: "asc" },
+    take: 50,
+  });
+  if (due.length === 0 && laggingPayouts.length === 0) return;
 
-  if (due.length > 1) {
-    log.engine("crash.settle.backlog", { dueRounds: due.length });
-  }
+  if (due.length > 1) log.engine("crash.settle.backlog", { dueRounds: due.length });
+
+  const crashXOf = (round: { result: string | null }): number => {
+    try {
+      return round.result ? JSON.parse(round.result).crashX ?? 100 : 100;
+    } catch {
+      return 100; // corrupt result blob → treat as instant crash, still settle
+    }
+  };
 
   for (const round of due) {
-    // Overdue by >10s means we are recovering a missed settlement, not settling
-    // a just-expired round — surface it.
     const lateMs = now.getTime() - round.settleAt.getTime();
     if (lateMs > 10_000) {
       log.settlement("crash.recovery", {
-        period: round.period.toString(),
-        state: round.state,
-        lateMs,
-        bets: round.bets.length,
+        period: round.period.toString(), state: round.state, lateMs,
       });
     }
 
-    let crashX = 100;
+    const crashX = crashXOf(round);
+
+    // ── PHASE A — atomic claim (single fast write, result already stored at creation) ──
+    let claimed = 0;
     try {
-      if (round.result) crashX = JSON.parse(round.result).crashX ?? 100;
-    } catch {
-      crashX = 100; // corrupt result blob → treat as instant crash, still settle
-    }
-
-    try {
-      let didSettle = false;
-      let unpaidWinners = 0;
-      await prisma.$transaction(async (tx) => {
-        const fresh = await tx.gameRound.findUnique({
-          where: { id: round.id },
-          include: { bets: true },
-        });
-        if (!fresh || fresh.state === "SETTLED") return;
-
-        for (const bet of fresh.bets) {
-          if (bet.status !== "PENDING") continue; // CASHED already credited
-          const autoX = parseInt(bet.selection, 10) || 0;
-          if (autoX >= 101 && autoX <= crashX) {
-            const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
-            const payout = Math.floor((stake * autoX) / 100);
-            try {
-              await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, {
-                game: GAME,
-                autoX,
-                crashX,
-              });
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: { status: "CASHED", cashoutX: autoX, payout },
-              });
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              if (msg === "WALLET_NOT_FOUND") {
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: { status: "LOST", payout: 0 },
-                });
-                unpaidWinners += 1;
-              } else {
-                throw e;
-              }
-            }
-          } else {
-            await tx.bet.update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } });
-          }
-        }
-
-        await tx.gameRound.update({
-          where: { id: round.id },
-          data: { state: "SETTLED", settledAt: new Date() },
-        });
-        didSettle = true;
+      const r = await prisma.gameRound.updateMany({
+        where: { id: round.id, state: { in: ["BETTING", "RUNNING"] } },
+        data: { state: "SETTLED", settledAt: new Date() },
       });
-      if (didSettle) {
-        log.settlement("crash.settled", {
-          period: round.period.toString(),
-          crashX,
-          bets: round.bets.length,
-          ...(unpaidWinners > 0 ? { unpaidWinners } : {}),
-        });
-      }
+      claimed = r.count;
     } catch (e) {
-      log.error("crash.settle.failed", {
-        period: round.period.toString(),
-        error: e instanceof Error ? e.message : String(e),
+      log.error("crash.claim.failed", {
+        period: round.period.toString(), error: e instanceof Error ? e.message : String(e),
+      });
+      continue;
+    }
+    if (claimed > 0) {
+      log.settlement("crash.settled", { period: round.period.toString(), crashX });
+    } else {
+      log.engine("crash.claim.alreadySettled", { period: round.period.toString() });
+    }
+
+    // ── PHASE B — drain payouts ──
+    await payCrashRoundBets(round.id, crashX);
+  }
+
+  for (const round of laggingPayouts) {
+    log.settlement("crash.payout.recovery", { period: round.period.toString() });
+    await payCrashRoundBets(round.id, crashXOf(round));
+  }
+}
+
+/**
+ * PHASE B for crash — resolve still-PENDING bets of a SETTLED round. Crash win
+ * condition is numeric (auto-cashout X in hundredths must be ≤ crashX), so we
+ * classify in JS, bulk-mark losers by id, and pay winners in tiny idempotent txns.
+ */
+async function payCrashRoundBets(roundId: string, crashX: number) {
+  const pending = await prisma.bet.findMany({ where: { roundId, status: "PENDING" } });
+  if (pending.length === 0) return;
+
+  const winners: typeof pending = [];
+  const loserIds: string[] = [];
+  for (const bet of pending) {
+    const autoX = parseInt(bet.selection, 10) || 0;
+    if (autoX >= 101 && autoX <= crashX) winners.push(bet);
+    else loserIds.push(bet.id);
+  }
+
+  if (loserIds.length) {
+    try {
+      await prisma.bet.updateMany({
+        where: { id: { in: loserIds }, status: "PENDING" },
+        data: { status: "LOST", payout: 0 },
+      });
+    } catch (e) {
+      log.error("crash.payout.losers.failed", {
+        roundId, error: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  let paid = 0;
+  let unpaid = 0;
+  for (const bet of winners) {
+    const autoX = parseInt(bet.selection, 10) || 0;
+    const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
+    const payout = Math.floor((stake * autoX) / 100);
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          const fresh = await tx.bet.findUnique({ where: { id: bet.id } });
+          if (!fresh || fresh.status !== "PENDING") return; // idempotent
+          await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, { game: GAME, autoX, crashX });
+          await tx.bet.update({
+            where: { id: bet.id },
+            data: { status: "CASHED", cashoutX: autoX, payout },
+          });
+        },
+        { timeout: 15_000, maxWait: 5_000 }
+      );
+      paid += 1;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg === "WALLET_NOT_FOUND") {
+        await prisma.bet
+          .update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } })
+          .catch(() => {});
+        unpaid += 1;
+      } else {
+        log.error("crash.payout.failed", { roundId, betId: bet.id, error: msg });
+      }
+    }
+  }
+
+  if (paid > 0 || unpaid > 0) {
+    log.settlement("crash.payouts.done", {
+      roundId, winners: winners.length, paid, ...(unpaid > 0 ? { unpaid } : {}),
+    });
   }
 }

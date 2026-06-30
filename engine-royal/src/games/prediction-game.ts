@@ -6,9 +6,15 @@ import { log } from "../logger";
 import {
   decidePredictionResult,
   payoutForBet,
+  colorsOfDigit,
   type PredictionForced,
   type EngineBet,
 } from "../engine/prediction-engine";
+
+/** All bet selections that WIN for a given winning digit (colours + the digit). */
+function winningSelectionsFor(digit: number): string[] {
+  return [...colorsOfDigit(digit), String(digit)];
+}
 
 // ── UNIFIED PREDICTION rounds (Color + Number) for the four game modes ──
 //
@@ -84,66 +90,72 @@ export async function ensureCurrentPredictionRound(mode: PredictionMode) {
 /**
  * Settle every due round of `mode`.
  *
- * Guarantees (see ROOT CAUSE notes in the PR):
- *  • RECOVERY — selects EVERY round whose timer has expired and is not yet
- *    SETTLED, OLDEST FIRST, so a settlement missed on a previous tick is picked
- *    up automatically on the next one. No round can stay BETTING after its
- *    settleAt forever.
- *  • RESILIENCE — one bad bet can no longer poison the whole round. A winner
- *    whose wallet is missing is recorded as LOST (and logged) instead of
- *    aborting the transaction, so the round always reaches SETTLED.
- *  • IDEMPOTENCY / LOCKING — the round is re-read INSIDE the transaction and
- *    skipped if already SETTLED, and only PENDING bets are paid. The final
- *    flip to SETTLED on the round document means two concurrent ticks collide
- *    on that write (MongoDB WriteConflict aborts the loser), so a duplicate
- *    tick can never produce a duplicate payout. `bet.status` is the idempotency
- *    key — a bet is paid at most once because it leaves PENDING in the same
- *    transaction that credits it.
+ * TWO-PHASE design — the previous single big `$transaction` (all bets + all
+ * wallet credits + the round flip together) blew past Prisma's 5s interactive-
+ * transaction timeout once a round had many bets, so under load the transaction
+ * aborted (P2028) every tick and the round stayed BETTING forever. We now split
+ * the work so the ROUND ALWAYS SETTLES regardless of bet volume:
+ *
+ *  PHASE A — CLAIM (one fast conditional write, NO wallet I/O): atomically flip
+ *    the round to SETTLED and write the result. `updateMany({ where: state != }`)
+ *    is a single-document atomic compare-and-set — it IS the lock: only one tick
+ *    can win the flip (count 1); a concurrent/duplicate tick sees count 0 and
+ *    stops. The round (and its result) become visible to history immediately.
+ *
+ *  PHASE B — PAYOUTS (drained in small, bounded, idempotent units): losers are
+ *    resolved in ONE bulk `updateMany` (no wallet I/O); each winner is paid in
+ *    its OWN tiny transaction (one wallet + one ledger row + one bet). `bet.status`
+ *    is the idempotency key — a winner leaves PENDING in the same tx that credits
+ *    it, and a WriteConflict between two ticks aborts the loser, so no double pay.
+ *    A small per-payout transaction can never hit the 5s timeout and barely
+ *    contends with live betting.
+ *
+ *  RECOVERY — any SETTLED round that still has PENDING bets (Phase B interrupted
+ *    on an earlier tick) is re-drained every tick, so payouts can never be lost.
  */
 export async function settleDuePredictionRounds(mode: PredictionMode) {
   const now = new Date();
+
+  // Rounds whose timer expired but that have NOT been settled yet (oldest first).
   const due = await prisma.gameRound.findMany({
     where: { game: mode, state: { not: "SETTLED" }, settleAt: { lte: now } },
     include: { bets: true },
-    orderBy: { settleAt: "asc" }, // oldest overdue first → drains backlog, no starvation
+    orderBy: { settleAt: "asc" },
     take: 50,
   });
-  if (due.length === 0) return;
+
+  // Already-settled rounds whose payouts did not fully drain (Phase B recovery).
+  const laggingPayouts = await prisma.gameRound.findMany({
+    where: { game: mode, state: "SETTLED", bets: { some: { status: "PENDING" } } },
+    orderBy: { settleAt: "asc" },
+    take: 50,
+  });
+
+  if (due.length === 0 && laggingPayouts.length === 0) return;
 
   const { roundMs } = await config(mode);
   const heavyWinRate = (await getSettingNumber("prediction_heavy_win_rate")) || 0.4;
-  // Single-player colour fairness knobs (default to the standard 0.4 / no cap).
   const singleColorWinRate =
     (await getSettingNumber("single_player_color_win_rate")) || heavyWinRate;
   const singleColorMaxPayout =
     (await getSettingNumber("single_player_color_max_payout")) || 0;
 
-  if (due.length > 1) {
-    log.engine("prediction.settle.backlog", { mode, dueRounds: due.length });
-  }
+  if (due.length > 1) log.engine("prediction.settle.backlog", { mode, dueRounds: due.length });
 
   for (const round of due) {
-    // A round overdue by more than one full cycle is a MISSED settlement that we
-    // are now recovering — surface it explicitly for observability.
     const lateMs = now.getTime() - round.settleAt.getTime();
     if (lateMs > roundMs) {
+      // Overdue by more than a full cycle → we are recovering a missed settlement.
       log.settlement("prediction.recovery", {
-        mode,
-        period: round.period.toString(),
-        state: round.state,
-        lateMs,
-        bets: round.bets.length,
+        mode, period: round.period.toString(), state: round.state, lateMs, bets: round.bets.length,
       });
     }
 
-    // Settlement and the house optimizer both price on the EFFECTIVE (post-fee)
-    // stake so exposure matches what is actually paid out. Legacy bets (no fee
-    // recorded) fall back to the gross amount.
+    // Decision is computed OUTSIDE any transaction (pure, deterministic).
     const engineBets: EngineBet[] = round.bets.map((b) => ({
       selection: b.selection,
       amount: b.effectiveBet > 0 ? b.effectiveBet : b.amount,
     }));
-    // Single-player colour fairness only triggers at exactly one distinct player.
     const uniquePlayers = new Set(round.bets.map((b) => b.userId)).size;
 
     let forced: PredictionForced | null = null;
@@ -166,92 +178,127 @@ export async function settleDuePredictionRounds(mode: PredictionMode) {
       singleColorMaxPayout,
     });
 
+    // ── PHASE A — atomic claim + result (single fast write, no wallet I/O) ──
+    let claimed = 0;
     try {
-      let didSettle = false;
-      let unpaidWinners = 0;
-      await prisma.$transaction(async (tx) => {
-        // Re-read the round + bets INSIDE the tx so we act on fresh state and a
-        // concurrent settlement (or an earlier partial attempt) cannot be redone.
-        const fresh = await tx.gameRound.findUnique({
-          where: { id: round.id },
-          include: { bets: true },
-        });
-        if (!fresh || fresh.state === "SETTLED") return; // already settled — idempotent no-op
-
-        for (const bet of fresh.bets) {
-          if (bet.status !== "PENDING") continue; // never repay a non-pending bet
-          const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
-          const payout = payoutForBet(bet.selection, stake, res.digit);
-
-          if (payout > 0) {
-            try {
-              await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, {
-                game: mode,
-                digit: res.digit,
-              });
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: { status: "WON", payout },
-              });
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              if (msg === "WALLET_NOT_FOUND") {
-                // The winner's wallet no longer exists (deleted user / orphaned
-                // bet). There is nobody to credit — record it as LOST so the
-                // round can still settle instead of being stuck forever.
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: { status: "LOST", payout: 0 },
-                });
-                unpaidWinners += 1;
-              } else {
-                throw e; // unexpected/transient → abort tx, retried next tick
-              }
-            }
-          } else {
-            await tx.bet.update({
-              where: { id: bet.id },
-              data: { status: "LOST", payout: 0 },
-            });
-          }
-        }
-
-        await tx.gameRound.update({
-          where: { id: round.id },
-          data: {
-            state: "SETTLED",
-            settledAt: new Date(),
-            // Public-safe result: digit + colours only (no engine internals).
-            result: JSON.stringify({
-              digit: res.digit,
-              colors: res.colors,
-              number: res.winningNumber,
-            }),
-          },
-        });
-        didSettle = true;
+      const r = await prisma.gameRound.updateMany({
+        where: { id: round.id, state: { not: "SETTLED" } },
+        data: {
+          state: "SETTLED",
+          settledAt: new Date(),
+          result: JSON.stringify({ digit: res.digit, colors: res.colors, number: res.winningNumber }),
+        },
       });
-
-      if (didSettle) {
-        log.settlement("prediction.settled", {
-          mode,
-          period: round.period.toString(),
-          digit: res.digit,
-          colors: res.colors,
-          decisionMode: res.mode,
-          uniquePlayers,
-          bets: round.bets.length,
-          ...(unpaidWinners > 0 ? { unpaidWinners } : {}),
-        });
-      }
+      claimed = r.count;
     } catch (e) {
-      // Logged, NOT rethrown: the next tick re-selects this round (recovery),
-      // and a failure here never blocks the other due rounds in this loop.
-      log.error("prediction.settle.failed", {
-        mode,
-        period: round.period.toString(),
+      // The claim itself failed (DB hiccup). Round stays BETTING and is retried
+      // next tick — proves exactly where we stopped.
+      log.error("prediction.claim.failed", {
+        mode, period: round.period.toString(), bets: round.bets.length,
         error: e instanceof Error ? e.message : String(e),
       });
+      continue;
     }
+
+    if (claimed === 0) {
+      // Another tick already settled it — idempotent no-op; still try to drain payouts.
+      log.engine("prediction.claim.alreadySettled", { mode, period: round.period.toString() });
+    } else {
+      log.settlement("prediction.settled", {
+        mode, period: round.period.toString(), digit: res.digit, colors: res.colors,
+        decisionMode: res.mode, uniquePlayers, bets: round.bets.length,
+      });
+    }
+
+    // ── PHASE B — drain payouts (bulk losers + per-winner tiny txns) ──
+    await payPredictionRoundBets(mode, round.id, res.digit);
+  }
+
+  // ── Recover any settled rounds whose payouts didn't finish earlier ──
+  for (const round of laggingPayouts) {
+    let digit: number | null = null;
+    try {
+      if (round.result) digit = JSON.parse(round.result).digit;
+    } catch {
+      digit = null;
+    }
+    if (digit == null) {
+      log.error("prediction.payout.recovery.noresult", { mode, period: round.period.toString() });
+      continue;
+    }
+    log.settlement("prediction.payout.recovery", { mode, period: round.period.toString() });
+    await payPredictionRoundBets(mode, round.id, digit);
+  }
+}
+
+/**
+ * PHASE B — resolve all still-PENDING bets of an already-SETTLED round.
+ * Losers settle in one bulk write; each winner is paid in its own tiny, bounded,
+ * idempotent transaction so neither a big-transaction timeout nor wallet
+ * contention with live betting can stall (or be undone by) settlement.
+ */
+async function payPredictionRoundBets(mode: PredictionMode, roundId: string, digit: number) {
+  const winning = winningSelectionsFor(digit);
+
+  // 1) Losers — single bulk update, no wallet I/O, no contention.
+  try {
+    await prisma.bet.updateMany({
+      where: { roundId, status: "PENDING", selection: { notIn: winning } },
+      data: { status: "LOST", payout: 0 },
+    });
+  } catch (e) {
+    log.error("prediction.payout.losers.failed", {
+      mode, roundId, error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
+  // 2) Winners — pay each in its own small transaction.
+  const winners = await prisma.bet.findMany({
+    where: { roundId, status: "PENDING", selection: { in: winning } },
+  });
+
+  let paid = 0;
+  let unpaid = 0;
+  for (const bet of winners) {
+    const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
+    const payout = payoutForBet(bet.selection, stake, digit);
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          const fresh = await tx.bet.findUnique({ where: { id: bet.id } });
+          if (!fresh || fresh.status !== "PENDING") return; // idempotent: already resolved
+          if (payout > 0) {
+            await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, { game: mode, digit });
+            await tx.bet.update({ where: { id: bet.id }, data: { status: "WON", payout } });
+          } else {
+            await tx.bet.update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } });
+          }
+        },
+        { timeout: 15_000, maxWait: 5_000 }
+      );
+      paid += 1;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg === "WALLET_NOT_FOUND") {
+        // Nobody to credit (deleted user / orphaned bet) — mark LOST so the bet
+        // leaves PENDING and the round is not re-scanned forever.
+        await prisma.bet
+          .update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } })
+          .catch(() => {});
+        unpaid += 1;
+      } else {
+        // Transient (WriteConflict / timeout): leave PENDING — the lagging-payout
+        // recovery pass retries it next tick. This is exactly where it stopped.
+        log.error("prediction.payout.failed", {
+          mode, roundId, betId: bet.id, error: msg,
+        });
+      }
+    }
+  }
+
+  if (paid > 0 || unpaid > 0) {
+    log.settlement("prediction.payouts.done", {
+      mode, roundId, winners: winners.length, paid, ...(unpaid > 0 ? { unpaid } : {}),
+    });
   }
 }
