@@ -1,8 +1,0 @@
-{"ts":"2026-07-01T16:36:40.845Z","level":"info","msg":"LIFECYCLE BETTING","data":{"mongoId":"6a4542181049cfe82d6a77b1","mode":"PARITY","period":"9905029","state":"BETTING","bets":1,"createdAt":"2026-07-01T16:36:40.819Z","settleAt":"2026-07-01T16:36:39.317Z","lateMs":1512}}
-{"ts":"2026-07-01T16:36:40.848Z","level":"info","msg":"LIFECYCLE RESULT_GENERATED","data":{"mongoId":"6a4542181049cfe82d6a77b1","mode":"PARITY","period":"9905029","digit":7,"colors":["GREEN"],"decisionMode":"HEAVY_WIN","bets":1}}
-{"ts":"2026-07-01T16:36:40.854Z","level":"info","msg":"LIFECYCLE SETTLED","data":{"mongoId":"6a4542181049cfe82d6a77b1","mode":"PARITY","period":"9905029","digit":7,"mongoWriteCount":1}}
-{"ts":"2026-07-01T16:36:40.888Z","level":"info","msg":"LIFECYCLE PAYOUT_COMPLETED","data":{"mongoId":"6a4542181049cfe82d6a77b1","mode":"PARITY","period":"9905029"}}
-{"ts":"2026-07-01T16:36:40.889Z","level":"info","msg":"LIFECYCLE BETTING","data":{"mongoId":"6a4542181049cfe82d6a77a5","mode":"PARITY","period":"9905028","state":"BETTING","bets":11,"createdAt":"2026-07-01T16:36:40.793Z","settleAt":"2026-07-01T16:36:38.789Z","lateMs":2040}}
-{"ts":"2026-07-01T16:36:40.890Z","level":"info","msg":"LIFECYCLE RESULT_GENERATED","data":{"mongoId":"6a4542181049cfe82d6a77a5","mode":"PARITY","period":"9905028","digit":1,"colors":["GREEN"],"decisionMode":"HEAVY_LOSE","bets":11}}
-{"ts":"2026-07-01T16:36:40.898Z","level":"info","msg":"LIFECYCLE SETTLED","data":{"mongoId":"6a4542181049cfe82d6a77a5","mode":"PARITY","period":"9905028","digit":1,"mongoWriteCount":1}}
-{"ts":"2026-07-01T16:36:40.923Z","level":"info","msg":"LIFECYCLE PAYOUT_COMPLETED","data":{"mongoId":"6a4542181049cfe82d6a77a5","mode":"PARITY","period":"9905028"}}
