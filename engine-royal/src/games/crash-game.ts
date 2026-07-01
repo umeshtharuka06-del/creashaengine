@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { applyBalance } from "../wallet";
 import { hashSeed, randomServerSeed } from "../fair";
@@ -95,7 +96,7 @@ export async function settleDueCrashRounds() {
   try {
     due = await prisma.gameRound.findMany({
       where: { game: GAME, state: { in: ["BETTING", "RUNNING"] }, settleAt: { lte: now } },
-      orderBy: { settleAt: "asc" },
+      orderBy: { settleAt: "desc" }, // newest due first (see prediction-game note); backlog still drains
       take: 50,
     });
   } catch (e) {
@@ -160,66 +161,88 @@ async function recoverUnpaidCrashRounds() {
  * classify in JS, bulk-mark losers by id, and pay winners in tiny idempotent txns.
  */
 async function payCrashRoundBets(roundId: string, crashX: number) {
-  const pending = await prisma.bet.findMany({ where: { roundId, status: "PENDING" } });
-  if (pending.length === 0) return;
-
-  const winners: typeof pending = [];
-  const loserIds: string[] = [];
-  for (const bet of pending) {
-    const autoX = parseInt(bet.selection, 10) || 0;
-    if (autoX >= 101 && autoX <= crashX) winners.push(bet);
-    else loserIds.push(bet.id);
-  }
-
-  if (loserIds.length) {
-    try {
-      await prisma.bet.updateMany({
-        where: { id: { in: loserIds }, status: "PENDING" },
-        data: { status: "LOST", payout: 0 },
-      });
-    } catch (e) {
-      log.error("crash.payout.losers.failed", {
-        roundId, error: e instanceof Error ? e.message : String(e),
-      });
-    }
-  }
-
+  // Paginate the round's bets by id (≤ BATCH at a time) so memory stays bounded
+  // no matter how many bets a heavy round has. Losers are bulk-marked per page;
+  // winners are paid in tiny idempotent transactions.
+  const BATCH = 500;
+  let winnersCount = 0;
   let paid = 0;
   let unpaid = 0;
-  for (const bet of winners) {
-    const autoX = parseInt(bet.selection, 10) || 0;
-    const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
-    const payout = Math.floor((stake * autoX) / 100);
-    try {
-      await prisma.$transaction(
-        async (tx) => {
-          const fresh = await tx.bet.findUnique({ where: { id: bet.id } });
-          if (!fresh || fresh.status !== "PENDING") return; // idempotent
-          await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, { game: GAME, autoX, crashX });
-          await tx.bet.update({
-            where: { id: bet.id },
-            data: { status: "CASHED", cashoutX: autoX, payout },
-          });
-        },
-        { timeout: 15_000, maxWait: 5_000 }
-      );
-      paid += 1;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg === "WALLET_NOT_FOUND") {
-        await prisma.bet
-          .update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } })
-          .catch(() => {});
-        unpaid += 1;
-      } else {
-        log.error("crash.payout.failed", { roundId, betId: bet.id, error: msg });
+  let cursor: string | undefined = undefined;
+
+  while (true) {
+    // Fixed set (all bets of the round) so the cursor row never changes filter
+    // membership; per-bet status is checked below for idempotency.
+    const args: Prisma.BetFindManyArgs = {
+      where: { roundId },
+      orderBy: { id: "asc" },
+      take: BATCH,
+    };
+    if (cursor) { args.cursor = { id: cursor }; args.skip = 1; }
+    const page = await prisma.bet.findMany(args);
+    if (page.length === 0) break;
+    cursor = page[page.length - 1].id;
+
+    const winners: typeof page = [];
+    const loserIds: string[] = [];
+    for (const bet of page) {
+      if (bet.status !== "PENDING") continue; // CASHED (manual) / already resolved
+      const autoX = parseInt(bet.selection, 10) || 0;
+      if (autoX >= 101 && autoX <= crashX) winners.push(bet);
+      else loserIds.push(bet.id);
+    }
+
+    if (loserIds.length) {
+      try {
+        await prisma.bet.updateMany({
+          where: { id: { in: loserIds }, status: "PENDING" },
+          data: { status: "LOST", payout: 0 },
+        });
+      } catch (e) {
+        log.error("crash.payout.losers.failed", {
+          roundId, error: e instanceof Error ? e.message : String(e),
+        });
       }
     }
+
+    for (const bet of winners) {
+      winnersCount += 1;
+      const autoX = parseInt(bet.selection, 10) || 0;
+      const stake = bet.effectiveBet > 0 ? bet.effectiveBet : bet.amount;
+      const payout = Math.floor((stake * autoX) / 100);
+      try {
+        await prisma.$transaction(
+          async (tx) => {
+            const fresh = await tx.bet.findUnique({ where: { id: bet.id } });
+            if (!fresh || fresh.status !== "PENDING") return; // idempotent
+            await applyBalance(tx, bet.userId, payout, "PAYOUT", bet.id, { game: GAME, autoX, crashX });
+            await tx.bet.update({
+              where: { id: bet.id },
+              data: { status: "CASHED", cashoutX: autoX, payout },
+            });
+          },
+          { timeout: 15_000, maxWait: 5_000 }
+        );
+        paid += 1;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg === "WALLET_NOT_FOUND") {
+          await prisma.bet
+            .update({ where: { id: bet.id }, data: { status: "LOST", payout: 0 } })
+            .catch(() => {});
+          unpaid += 1;
+        } else {
+          log.error("crash.payout.failed", { roundId, betId: bet.id, error: msg });
+        }
+      }
+    }
+
+    if (page.length < BATCH) break;
   }
 
   if (paid > 0 || unpaid > 0) {
     log.settlement("crash.payouts.done", {
-      roundId, winners: winners.length, paid, ...(unpaid > 0 ? { unpaid } : {}),
+      roundId, winners: winnersCount, paid, ...(unpaid > 0 ? { unpaid } : {}),
     });
   }
 }

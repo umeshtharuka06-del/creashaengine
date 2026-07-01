@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "worker": "tsx scripts/settle-worker.ts",
+    "trace": "tsx scripts/trace-lifecycle.ts",
     "create-rounds": "tsx scripts/create-rounds.ts",
     "process-rounds": "tsx scripts/process-rounds.ts",
     "build": "prisma generate && tsc --noEmit",
