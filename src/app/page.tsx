@@ -19,10 +19,6 @@ interface Announcement {
   title: string;
   body: string;
 }
-interface PredRound {
-  id: string;
-  result: { digit: number } | null;
-}
 
 const MODES = [
   { key: "PARITY", label: "Parity", color: "#28c76f" },
@@ -34,29 +30,11 @@ const MODES = [
 export default function HomePage() {
   const { me, loading } = useUser();
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
-  const [results, setResults] = useState<PredRound[]>([]);
 
   useEffect(() => {
     api<Announcement[]>("/api/announcements").then(
       (r) => r.ok && setAnnouncements(r.data || [])
     );
-  }, []);
-
-  // Last 10 results — polled, never more than 10, newest first.
-  useEffect(() => {
-    let stop = false;
-    const load = async () => {
-      const r = await api<{ history: PredRound[] }>(
-        "/api/games/prediction/PARITY/current"
-      );
-      if (!stop && r.ok && r.data) setResults(r.data.history.slice(0, 10));
-    };
-    load();
-    const t = setInterval(load, 5000);
-    return () => {
-      stop = true;
-      clearInterval(t);
-    };
   }, []);
 
   const ann = announcements[0];
@@ -135,48 +113,6 @@ export default function HomePage() {
           <span className="text-game-gold">→</span>
         </Link>
       </section>
-
-      {/* Last 10 game results */}
-      <section>
-        <div className="mb-2.5 flex items-center justify-between">
-          <h2 className="text-base font-bold">Last 10 results</h2>
-          <Link href="/game" className="text-xs font-semibold text-game-gold">
-            Play →
-          </Link>
-        </div>
-        <div className="card p-4">
-          {results.length === 0 ? (
-            <div className="flex flex-wrap gap-2">
-              {Array.from({ length: 10 }).map((_, i) => (
-                <div key={i} className="skeleton h-9 w-9 rounded-full" />
-              ))}
-            </div>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {results.map((r) => (
-                <ResultBall key={r.id} digit={r.result?.digit ?? null} />
-              ))}
-            </div>
-          )}
-        </div>
-      </section>
     </div>
   );
-}
-
-function ResultBall({ digit }: { digit: number | null }) {
-  return (
-    <span
-      className="grid h-9 w-9 place-items-center rounded-full text-sm font-black text-white"
-      style={{ background: digit === null ? "#222e47" : numberBg(digit) }}
-    >
-      {digit ?? "?"}
-    </span>
-  );
-}
-
-function numberBg(d: number) {
-  if (d === 0) return "linear-gradient(135deg, #f23b4e 0 50%, #9b4dff 50% 100%)";
-  if (d === 5) return "linear-gradient(135deg, #28c76f 0 50%, #9b4dff 50% 100%)";
-  return d % 2 === 0 ? "#f23b4e" : "#28c76f";
 }
