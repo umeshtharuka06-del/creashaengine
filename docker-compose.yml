@@ -1,0 +1,333 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Royal 1 — SINGLE production stack (Contabo Ubuntu 24.04 · Docker Compose V2 ·
+# Portainer Stacks). NOT Swarm.
+#
+#   Cloudflare → Nginx (only host-exposed: 80/443) → appnet bridge:
+#     web · telegram-worker · deposit-scanner · withdraw-queue · engine
+#     · redis · nginx (+ certbot) · watchtower · mongo (optional, profile local-db)
+#
+# Portainer compatibility notes:
+#   • No `deploy:` blocks (Swarm-only) — resource limits use the non-swarm
+#     top-level keys `mem_limit` / `mem_reservation` / `pids_limit`. This also
+#     removes the `pids_limit` vs `deploy.resources.limits.pids` conflict.
+#   • Env via ${VAR} interpolation (Portainer stack env vars, or a local .env)
+#     instead of env_file, so the stack deploys straight from Git with no file
+#     that must exist on disk.
+#
+# Start:  docker compose up -d        (with local Mongo: --profile local-db)
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    tag: "{{.Name}}"
+
+# Shared application environment (interpolated from Portainer stack vars / .env).
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-production}
+  DATABASE_URL: ${DATABASE_URL}
+  JWT_SECRET: ${JWT_SECRET}
+  FAIR_SECRET: ${FAIR_SECRET}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+  CRON_SECRET: ${CRON_SECRET:-}
+  TRONGRID_API_KEY: ${TRONGRID_API_KEY:-}
+  SIGNUP_BONUS_COINS: ${SIGNUP_BONUS_COINS:-1000}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  PAYMENTS_ENABLED: ${PAYMENTS_ENABLED:-false}
+  PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-stub}
+
+# Common config for the app image (built once, reused by web + workers).
+# Default resource sizing is worker-sized; web overrides below.
+x-app: &app
+  image: royal1-app:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  networks: [appnet]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  mem_limit: 320m
+  mem_reservation: 96m
+  stop_grace_period: 30s
+  logging: *logging
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  # ── Website (Next.js) ──────────────────────────────────────────────────────
+  web:
+    <<: *app
+    container_name: royal1-web
+    command: ["npm", "run", "start"]
+    environment:
+      <<: *app-env
+      PORT: "3000"
+    mem_limit: 768m
+    mem_reservation: 256m
+    expose:
+      - "3000"                # internal only — reached by nginx as http://web:3000
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ── Telegram worker ────────────────────────────────────────────────────────
+  telegram-worker:
+    <<: *app
+    container_name: royal1-telegram-worker
+    command: ["npm", "run", "worker:telegram"]
+    environment:
+      <<: *app-env
+      TELEGRAM_HEALTH_PORT: "4101"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4101/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Deposit scanner (replaces Vercel Cron) ─────────────────────────────────
+  deposit-scanner:
+    <<: *app
+    container_name: royal1-deposit-scanner
+    command: ["npm", "run", "worker:deposit"]
+    environment:
+      <<: *app-env
+      DEPOSIT_HEALTH_PORT: "4102"
+      DEPOSIT_POLL_SECONDS: ${DEPOSIT_POLL_SECONDS:-0}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4102/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Withdraw queue ─────────────────────────────────────────────────────────
+  withdraw-queue:
+    <<: *app
+    container_name: royal1-withdraw-queue
+    command: ["npm", "run", "worker:withdraw"]
+    environment:
+      <<: *app-env
+      WITHDRAW_HEALTH_PORT: "4103"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4103/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Results Engine (engine-royal — independent service, same repo) ─────────
+  # Settles due rounds + ensures upcoming rounds exist, sharing the same MongoDB
+  # as the website (no HTTP coupling). Engine source/Dockerfile are unchanged.
+  engine:
+    image: royal1-engine:latest
+    build:
+      context: ./engine-royal
+      dockerfile: Dockerfile
+    container_name: royal1-engine
+    environment:
+      <<: *app-env
+      ENGINE_INTERVAL: ${ENGINE_INTERVAL:-1000}
+      HEALTH_PORT: "4000"
+    restart: unless-stopped
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 384m
+    mem_reservation: 96m
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+
+  # ── Redis (durable job queue) ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: royal1-redis
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - redis-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks: [appnet]
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    mem_reservation: 64m
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *logging
+
+  # ── Nginx reverse proxy (the ONLY host-exposed service) ────────────────────
+  # Config (conf.d + snippets) is BAKED INTO the image — see nginx/Dockerfile.
+  # It is NOT bind-mounted, because relative host bind mounts (./nginx/conf.d)
+  # resolve to an empty auto-created dir under Portainer Git/Web-editor stacks,
+  # leaving /etc/nginx/conf.d empty and the site unreachable. Only runtime state
+  # (TLS certs, ACME webroot, proxy cache) uses volumes.
+  nginx:
+    image: royal1-nginx:latest
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: royal1-nginx
+    restart: unless-stopped
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - letsencrypt:/etc/letsencrypt        # cert store, shared with certbot (rw: entrypoint seeds a bootstrap cert)
+      - certbot-www:/var/www/certbot:ro      # ACME http-01 webroot, shared with certbot
+      - nginx-cache:/var/cache/nginx
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 128m
+    mem_reservation: 32m
+    stop_grace_period: 15s
+    healthcheck:
+      # busybox wget (alpine) does not reliably support --spider; -O /dev/null
+      # is portable and still fails the check on any non-2xx response.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *logging
+
+  # ── Certbot (Let's Encrypt: initial issuance + auto-renewal) ───────────────
+  certbot:
+    image: certbot/certbot:latest
+    container_name: royal1-certbot
+    restart: unless-stopped
+    depends_on:
+      - nginx
+    environment:
+      DOMAIN: ${DOMAIN:-mega99.xyz}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-}
+      STAGING: ${STAGING:-0}
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    # On first boot, if no Certbot-managed cert exists yet, request a REAL
+    # Let's Encrypt cert via the http-01 webroot (nginx already serves :80 +
+    # the bootstrap self-signed cert), replacing the temporary cert and
+    # signalling nginx to reload. Afterwards, renew every 12h; the --deploy-hook
+    # re-signals nginx so renewed certs are picked up without a restart.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        DOMAIN="$${DOMAIN:-mega99.xyz}"
+        EMAIL="$${CERTBOT_EMAIL:-}"
+        STAGING_FLAG=""
+        if [ "$${STAGING:-0}" = "1" ]; then STAGING_FLAG="--staging"; fi
+        RENEWAL="/etc/letsencrypt/renewal/$${DOMAIN}.conf"
+        trap exit TERM
+        # Give nginx a moment to bind :80 (it serves the http-01 challenge).
+        sleep 10
+        while :; do
+          if [ -f "$${RENEWAL}" ]; then
+            # Real cert already managed by Certbot — keep it renewed (12h cadence).
+            certbot renew --webroot -w /var/www/certbot --quiet \
+              --deploy-hook "touch /etc/letsencrypt/.reload"
+            sleep 12h & wait $${!}
+          elif [ -n "$${EMAIL}" ]; then
+            # No managed cert yet — replace the bootstrap self-signed cert with a
+            # real Let's Encrypt one. Drop the seeded dummy first so Certbot writes
+            # a clean lineage at the path royal1.conf references.
+            echo "[certbot] Requesting Let's Encrypt certificate for $${DOMAIN}"
+            rm -rf "/etc/letsencrypt/live/$${DOMAIN}" "/etc/letsencrypt/archive/$${DOMAIN}" "$${RENEWAL}"
+            if certbot certonly --webroot -w /var/www/certbot \
+                 --non-interactive --agree-tos --no-eff-email \
+                 --email "$${EMAIL}" $${STAGING_FLAG} \
+                 -d "$${DOMAIN}" -d "www.$${DOMAIN}"; then
+              echo "[certbot] Issued real certificate; signalling nginx to reload"
+              touch /etc/letsencrypt/.reload
+            else
+              echo "[certbot] Issuance failed (DNS/ACME not ready?); retrying in 15m"
+              sleep 15m & wait $${!}
+            fi
+          else
+            echo "[certbot] CERTBOT_EMAIL not set; staying on bootstrap self-signed cert"
+            sleep 12h & wait $${!}
+          fi
+        done
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    mem_limit: 128m
+    logging: *logging
+
+  # ── Watchtower (auto-update pull-based images) ─────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: royal1-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["--cleanup", "--interval", "300", "--label-enable"]
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    logging: *logging
+
+  # ── MongoDB (optional local DB; Atlas is the default) ──────────────────────
+  # Enabled only with:  docker compose --profile local-db up -d
+  # Betting/wallet transactions require a REPLICA SET — started with --replSet rs0;
+  # run `rs.initiate()` once (see deploy notes).
+  mongo:
+    image: mongo:7
+    container_name: royal1-mongo
+    profiles: ["local-db"]
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo-data:/data/db
+    networks: [appnet]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 1024m
+    mem_reservation: 512m
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+networks:
+  appnet:
+    driver: bridge
+
+volumes:
+  redis-data:
+  mongo-data:
+  nginx-cache:
+  letsencrypt:     # TLS certs, shared by nginx + certbot (replaces ./certbot/conf host bind)
+  certbot-www:     # ACME http-01 webroot, shared by nginx + certbot (replaces ./certbot/www host bind)

@@ -1,0 +1,11 @@
+# /etc/systemd/system/royal1-backup.timer
+[Unit]
+Description=Daily Royal 1 MongoDB backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+# Royal 1 — Fail2Ban jails (/etc/fail2ban/jail.local)
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+# Ban via UFW so bans match the firewall in use.
+banaction = ufw
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled  = true
+port     = ssh
+maxretry = 3
+bantime  = 2h
+
+# ── Optional: ban IPs that repeatedly trip Nginx rate limits ────────────────
+# Requires Nginx access/error logs to be readable on the host. By default this
+# stack logs to the Docker json-file driver (stdout), so enable this only after
+# mounting Nginx logs to a host path and pointing logpath at it. The
+# nginx-limit-req filter ships with Fail2Ban.
+[nginx-limit-req]
+enabled  = false
+port     = http,https
+filter   = nginx-limit-req
+logpath  = /opt/royal1/nginx/logs/error.log
+maxretry = 10
+findtime = 5m
+bantime  = 1h

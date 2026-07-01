@@ -1,0 +1,21 @@
+# /etc/systemd/system/royal1.service
+# Brings the whole Docker Compose stack up on boot and down on stop. Combined
+# with each service's `restart: unless-stopped`, this guarantees the platform —
+# and every worker — comes back automatically after a reboot or crash.
+[Unit]
+Description=Royal 1 production stack (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/royal1
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose up -d --remove-orphans
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# /etc/systemd/system/royal1-backup.service
+[Unit]
+Description=Royal 1 MongoDB backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/royal1
+ExecStart=/opt/royal1/deploy/backup/mongo-backup.sh
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
