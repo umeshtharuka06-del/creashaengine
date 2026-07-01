@@ -79,67 +79,78 @@ async function promoteState(r: { id: string; state: string; startAt: Date }) {
  * under load), then payouts drain in bulk (losers) + small idempotent per-winner
  * transactions. SETTLED rounds with leftover PENDING bets are recovered each tick.
  */
+const crashXOf = (round: { result: string | null }): number => {
+  try {
+    return round.result ? JSON.parse(round.result).crashX ?? 100 : 100;
+  } catch {
+    return 100; // corrupt result blob → treat as instant crash, still settle
+  }
+};
+
 export async function settleDueCrashRounds() {
   const now = new Date();
-  const due = await prisma.gameRound.findMany({
-    where: { game: GAME, state: { in: ["BETTING", "RUNNING"] }, settleAt: { lte: now } },
-    orderBy: { settleAt: "asc" },
-    take: 50,
-  });
-  const laggingPayouts = await prisma.gameRound.findMany({
-    where: { game: GAME, state: "SETTLED", bets: { some: { status: "PENDING" } } },
-    orderBy: { settleAt: "asc" },
-    take: 50,
-  });
-  if (due.length === 0 && laggingPayouts.length === 0) return;
 
-  if (due.length > 1) log.engine("crash.settle.backlog", { dueRounds: due.length });
+  // STAGE 1 — due rounds only (scalar filters, no relation filters).
+  let due;
+  try {
+    due = await prisma.gameRound.findMany({
+      where: { game: GAME, state: { in: ["BETTING", "RUNNING"] }, settleAt: { lte: now } },
+      orderBy: { settleAt: "asc" },
+      take: 50,
+    });
+  } catch (e) {
+    log.error("crash.due.query.failed", { error: e instanceof Error ? e.message : String(e) });
+    return;
+  }
+  if (due.length > 0) log.engine("crash.settle.due", { dueRounds: due.length });
 
-  const crashXOf = (round: { result: string | null }): number => {
-    try {
-      return round.result ? JSON.parse(round.result).crashX ?? 100 : 100;
-    } catch {
-      return 100; // corrupt result blob → treat as instant crash, still settle
-    }
-  };
-
+  // STAGE 2 — settle each round independently; atomic claim guarantees progress.
   for (const round of due) {
-    const lateMs = now.getTime() - round.settleAt.getTime();
-    if (lateMs > 10_000) {
-      log.settlement("crash.recovery", {
-        period: round.period.toString(), state: round.state, lateMs,
-      });
-    }
-
-    const crashX = crashXOf(round);
-
-    // ── PHASE A — atomic claim (single fast write, result already stored at creation) ──
-    let claimed = 0;
     try {
+      const lateMs = now.getTime() - round.settleAt.getTime();
+      if (lateMs > 10_000) {
+        log.settlement("crash.recovery", {
+          period: round.period.toString(), state: round.state, lateMs,
+        });
+      }
+      const crashX = crashXOf(round);
+
       const r = await prisma.gameRound.updateMany({
         where: { id: round.id, state: { in: ["BETTING", "RUNNING"] } },
         data: { state: "SETTLED", settledAt: new Date() },
       });
-      claimed = r.count;
+      if (r.count > 0) log.settlement("crash.settled", { period: round.period.toString(), crashX });
+      else log.engine("crash.claim.alreadySettled", { period: round.period.toString() });
+
+      await payCrashRoundBets(round.id, crashX);
     } catch (e) {
-      log.error("crash.claim.failed", {
+      log.error("crash.settle.round.failed", {
         period: round.period.toString(), error: e instanceof Error ? e.message : String(e),
       });
-      continue;
     }
-    if (claimed > 0) {
-      log.settlement("crash.settled", { period: round.period.toString(), crashX });
-    } else {
-      log.engine("crash.claim.alreadySettled", { period: round.period.toString() });
-    }
-
-    // ── PHASE B — drain payouts ──
-    await payCrashRoundBets(round.id, crashX);
   }
 
-  for (const round of laggingPayouts) {
+  // STAGE 3 — isolated payout recovery (no relation filters).
+  try {
+    await recoverUnpaidCrashRounds();
+  } catch (e) {
+    log.error("crash.payout.recovery.failed", { error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+/** Drain payouts for already-SETTLED crash rounds whose Phase B was interrupted. */
+async function recoverUnpaidCrashRounds() {
+  const pending = await prisma.bet.findMany({
+    where: { game: GAME, status: "PENDING" },
+    select: { roundId: true },
+    take: 2000,
+  });
+  const roundIds = [...new Set(pending.map((b) => b.roundId))];
+  for (const roundId of roundIds) {
+    const round = await prisma.gameRound.findUnique({ where: { id: roundId } });
+    if (!round || round.state !== "SETTLED") continue; // live round → skip
     log.settlement("crash.payout.recovery", { period: round.period.toString() });
-    await payCrashRoundBets(round.id, crashXOf(round));
+    await payCrashRoundBets(roundId, crashXOf(round));
   }
 }
 
