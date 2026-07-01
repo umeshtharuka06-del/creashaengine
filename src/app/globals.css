@@ -1,0 +1,200 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Mega 99 — Premium gaming theme (FLAT, gold-on-black, no glass)
+   Component classes (card/glass, btn variants, input, chip) are kept so the
+   existing admin / crash / auth / history markup keeps rendering. The look is
+   flat: solid surfaces, simple gradients on buttons only, no backdrop blur.
+   ────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Premium gaming typography (loaded by next/font in layout.tsx). */
+  --font-sans: var(--font-body), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-head: var(--font-display), var(--font-body), ui-sans-serif, system-ui, sans-serif;
+
+  /* ── Mega 99 design system (from the logo: gold on black) ── */
+  --page: #0b0e16;          /* near-black page */
+  --surface: #141a28;       /* solid card */
+  --surface-2: #1c2438;     /* raised / hover card */
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 215, 130, 0.22);
+
+  --gold: #f6c343;
+  --gold-deep: #d99a1c;
+  --gold-soft: #ffe08a;
+  --blue: #2f6df6;
+  --blue-deep: #1d4ed8;
+  --green: #28c76f;
+  --green-deep: #129e53;
+  --red: #f23b4e;
+  --red-deep: #d11f33;
+  --purple: #9b4dff;
+  --purple-deep: #7c2dff;
+
+  /* App shell width (phone-like, centered on larger screens). */
+  --shell: 480px;
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  color: #eef2fb;
+  background-color: var(--page);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+/* Headings + brand use the display face for a cohesive gaming identity. */
+h1, h2, h3, .font-display {
+  font-family: var(--font-head);
+  letter-spacing: -0.01em;
+}
+
+/* Desktop: the player app is a phone-width column by design (it has a mobile
+   bottom nav). Add a subtle backdrop + framed edges so on large screens it
+   reads as a deliberate app frame instead of a tiny centred box on emptiness.
+   Admin uses its own full-width container (see AppFrame) and is unaffected. */
+@media (min-width: 640px) {
+  body {
+    background-image:
+      radial-gradient(70% 50% at 50% -10%, rgba(246, 195, 67, 0.10) 0%, transparent 55%),
+      radial-gradient(80% 60% at 50% 0%, #131a2b 0%, transparent 60%);
+    background-attachment: fixed;
+  }
+}
+
+@layer components {
+  /* Flat solid card (alias .glass kept for legacy markup — no blur, no glass). */
+  .card,
+  .glass {
+    @apply rounded-2xl;
+    background: var(--surface);
+    border: 1px solid var(--line);
+  }
+  .glass-hover {
+    @apply transition;
+  }
+  .glass-hover:active {
+    background: var(--surface-2);
+  }
+
+  /* Buttons — rounded, solid, large tap targets, flat. */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3.5
+      text-sm font-bold transition active:scale-[0.98] disabled:cursor-not-allowed
+      disabled:opacity-50;
+  }
+  .btn-blue { @apply btn text-white; background: var(--blue); }
+  .btn-blue:active { background: var(--blue-deep); }
+  .btn-green { @apply btn text-white; background: var(--green); }
+  .btn-green:active { background: var(--green-deep); }
+  .btn-red { @apply btn text-white; background: var(--red); }
+  .btn-red:active { background: var(--red-deep); }
+  .btn-yellow { @apply btn text-white; background: var(--gold); }
+  /* Primary brand action — gold gradient, matches the logo. */
+  .btn-gold {
+    @apply btn;
+    color: #2a1d00;
+    background: linear-gradient(180deg, var(--gold-soft), var(--gold) 55%, var(--gold-deep));
+    box-shadow: 0 8px 24px -10px rgba(246, 195, 67, 0.6);
+  }
+  .btn-gold:active { filter: brightness(0.96); }
+  .btn-ghost {
+    @apply btn;
+    color: #cdd7ee;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+  }
+  .btn-ghost:active { background: var(--surface); color: #fff; }
+
+  .input {
+    @apply w-full rounded-xl px-4 py-3.5 text-sm text-white outline-none transition;
+    background: #0f1626;
+    border: 1px solid var(--line-strong);
+  }
+  .input::placeholder { color: #7282a6; }
+  .input:focus { border-color: var(--blue); }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold;
+  }
+
+  /* Mega 99 gold brand gradient for wordmarks / headings. */
+  .brand-gradient {
+    background: linear-gradient(100deg, var(--gold-soft) 0%, var(--gold) 45%, var(--gold-deep) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* App shell: phone-like column centered on large screens. */
+  .app-shell {
+    width: 100%;
+    max-width: var(--shell);
+    margin-inline: auto;
+  }
+
+  /* Break a child out of the centered shell to full viewport width
+     (used by the public landing page so it can use the whole screen). */
+  .full-bleed {
+    width: 100vw;
+    margin-left: 50%;
+    transform: translateX(-50%);
+  }
+
+  /* Loading skeleton block. */
+  .skeleton {
+    position: relative;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 0.75rem;
+  }
+  .skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(255, 255, 255, 0.08),
+      transparent
+    );
+    animation: shimmer 1.4s infinite;
+  }
+  @keyframes shimmer {
+    100% { transform: translateX(100%); }
+  }
+
+  /* Deposit "payment submitted" success checkmark. */
+  .success-check {
+    animation: pop-in 0.4s cubic-bezier(0.18, 0.89, 0.32, 1.28) both;
+    font-weight: 900;
+  }
+  @keyframes pop-in {
+    0% { transform: scale(0); opacity: 0; }
+    60% { transform: scale(1.18); opacity: 1; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.14);
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); }
+
+/* Hide scrollbar utility for horizontal chip rows. */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
